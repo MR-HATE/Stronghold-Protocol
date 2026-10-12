@@ -9,7 +9,7 @@ assert.ok(block, 'the workflow contains one inline script');
 const script = block[1].replace(/^ {12}/gm, '');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const run = new AsyncFunction('github', 'context', 'core', script);
-const repo = { owner: 'sganggs', repo: 'Stronghold-Protocol' };
+const repo = { owner: 'MR-HATE', repo: 'Stronghold-Protocol_With_account_and_sync' };
 
 function harness(title, { labels = [], action = 'opened', changes, eventTitle = title, labelError, addError } = {}) {
   const calls = [];

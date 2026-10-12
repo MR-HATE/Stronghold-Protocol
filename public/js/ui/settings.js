@@ -184,7 +184,7 @@ function HotkeySection({ keys, touchUi }) {
 }
 
 /** Where a report goes: the upstream issue tracker (shown as text the player can select; a link may open nothing). */
-export const ISSUES_URL = 'https://github.com/sganggs/Stronghold-Protocol/issues';
+export const ISSUES_URL = 'https://github.com/MR-HATE/Stronghold-Protocol_With_account_and_sync/issues';
 
 /**
  * 问题反馈: copy the diagnostics of this page (diag.js) for a GitHub issue — the errors recorded since the page opened,

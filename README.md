@@ -98,8 +98,8 @@ English summary: [below](#english).
 ### 方式二：从源码运行
 
 ```bash
-git clone https://github.com/sganggs/Stronghold-Protocol.git
-cd Stronghold-Protocol
+git clone https://github.com/MR-HATE/Stronghold-Protocol_With_account_and_sync.git
+cd Stronghold-Protocol_With_account_and_sync
 npm install        # 安装依赖（postinstall 会把 pixi / preact / three 复制到 public/vendor）
 npm run setup      # 检查环境，并从公开镜像下载约 550 MB 美术 / 音频（可中断，再次运行会续传）
 npm start          # 启动服务器：http://localhost:3000

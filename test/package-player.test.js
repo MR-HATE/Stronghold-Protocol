@@ -63,7 +63,7 @@ test('packaged copies of the shipped docs point unshipped relative links at the 
   const shipped = new Set(selectTracked(trackedFiles(ROOT)).keep);
   const version = pkg.version;
   const tag = releaseTag(version);
-  const host = 'https://github.com/sganggs/Stronghold-Protocol';
+  const host = 'https://github.com/MR-HATE/Stronghold-Protocol_With_account_and_sync';
   const focus = new Set(['README.md', 'docs/PLAYING.md', 'docs/DEPLOY.md']);
   let fileRewrites = 0;
   assert.ok(PLAYER_MARKDOWN.includes('README.md') && PLAYER_MARKDOWN.includes('docs/PLAYING.md') && PLAYER_MARKDOWN.includes('docs/DEPLOY.md'));

@@ -8,7 +8,7 @@
 需要 Node.js 22 或 24（CI 在这两个版本上跑）。
 
 ```bash
-git clone https://github.com/sganggs/Stronghold-Protocol.git
+git clone https://github.com/MR-HATE/Stronghold-Protocol_With_account_and_sync.git
 cd Stronghold-Protocol
 npm install        # postinstall 把 pixi / preact / three 复制到 public/vendor
 npm run setup      # 下载美术 / 音频（只跑测试可以不下载，缺素材的用例会自动跳过）

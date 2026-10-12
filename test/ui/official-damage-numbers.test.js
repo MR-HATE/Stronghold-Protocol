@@ -52,7 +52,7 @@ test('every interface pack translates the new settings and title strings', () =>
 test('the title page links the project repository in a new tab', () => {
   const src = read('public/js/screens/title.js');
   assert.match(src, /class="title-repo"/);
-  assert.match(src, /href="https:\/\/github\.com\/sganggs\/Stronghold-Protocol"/);
+  assert.match(src, /href="https:\/\/github\.com\/MR-HATE\/Stronghold-Protocol_With_account_and_sync"/);
   assert.match(src, /target="_blank"/);
   assert.match(src, /rel="noopener noreferrer"/);
   assert.match(src, /t\('项目仓库'\)/);
