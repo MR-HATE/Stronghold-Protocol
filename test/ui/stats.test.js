@@ -15,6 +15,8 @@ import {
   loadStats, saveStats, migrateStats, normalizeRecord, importStats, exportStats, aggregateStats, selfRowOf, roomModeOf,
   recordToResult, compactRecord, fitToBudget, countsTowardStats, roundsOf, clearedRounds, createLiveMatch, observeMatch,
   buildQuitRecord, installStatsRecorder, liveMatch, MIGRATIONS,
+  statsOwner, setStatsOwner, onStatsChanged, applyAccountStats, statsSyncPayload, SYNC_MAX_BYTES,
+  statsFingerprint, statsSyncState, setStatsSyncState,
 } from '../../public/js/ui/stats.js';
 import { createStore, emptyMatch } from '../../public/js/store.js';
 import { normalizeResult } from '../../public/js/ui/gameLogic.js';
@@ -724,4 +726,115 @@ describe('local stats: recordToResult (history row → settlement re-view)', () 
     assert.equal(recordToResult(null), null);
     assert.equal(recordToResult({ players: [] }), null);
   });
+});
+
+// ---- the account mirror (extension §account: `stats.push` / `stats.pull`, server/stats.js) ------------------------
+
+/** One settled record for the mirror tests (a distinct `seed` gives it a distinct id). */
+const accountRecord = (seed, now) => buildRecord(baseResult({ seed }), { myId: 'p1', roomMode: 'solo', now });
+
+describe('local stats: the account mirror', () => {
+  test('statsOwner starts null; a guest history is adopted by the first account that signs in', () => withStorage(() => {
+    saveStats(manyRecords(3));
+    assert.equal(statsOwner(), null, 'nothing claimed this browser yet');
+    const incoming = { v: STATS_VERSION, records: [accountRecord(99, 50)] };
+    const res = applyAccountStats(incoming, { key: 'alice' });
+    assert.equal(res.replaced, false, 'a 游客 history is adopted, not thrown away');
+    assert.equal(res.added, 1, 'the account record was new here');
+    assert.equal(statsOwner(), 'alice', 'the account now owns the local copy');
+    assert.equal(res.stats.records.length, 4, 'union');
+    assert.ok(res.stats.records.some((r) => r.id === incoming.records[0].id));
+    assert.equal(loadStats().records.length, 4, 'and it was persisted');
+  }));
+
+  test('the same account re-merges (idempotent): nothing is duplicated and new records join', () => withStorage(() => {
+    saveStats(manyRecords(2)); // t = 1, 0
+    setStatsOwner('alice');
+    const again = applyAccountStats({ v: STATS_VERSION, records: loadStats().records }, { key: 'alice' });
+    assert.equal(again.added, 0, 'the same records are not added twice');
+    assert.equal(again.stats.records.length, 2);
+    const fresh = applyAccountStats({ v: STATS_VERSION, records: [accountRecord(42, 90)] }, { key: 'alice' });
+    assert.equal(fresh.added, 1);
+    assert.equal(fresh.stats.records.length, 3);
+    assert.equal(fresh.stats.records[0].t, 90, 'newest first');
+  }));
+
+  test('a DIFFERENT account replaces the local history instead of absorbing it (isolation)', () => withStorage(() => {
+    saveStats(manyRecords(3));
+    setStatsOwner('alice');
+    const bob = { v: STATS_VERSION, records: [accountRecord(7, 10)] };
+    const res = applyAccountStats(bob, { key: 'bob' });
+    assert.equal(res.replaced, true, 'alice\'s matches must not become bob\'s');
+    assert.deepEqual(res.stats.records.map((r) => r.id), bob.records.map((r) => r.id));
+    assert.equal(statsOwner(), 'bob');
+    // …and the account's own copy is what stays: a later pull from alice's account is foreign again
+    assert.equal(loadStats().records.length, 1);
+  }));
+
+  test('a 清空统计数据 stamp drops the records it cleared instead of merging them back', () => withStorage(() => {
+    const old = manyRecords(4); // t = 3 … 0
+    saveStats(old);
+    setStatsOwner('alice');
+    const payload = { v: STATS_VERSION, records: old.records };
+    const res = applyAccountStats(payload, { key: 'alice', clearedAt: 5 }); // everything is older than the stamp
+    assert.equal(res.stats.records.length, 0, 'the clear wins over a stale device');
+    assert.ok(res.cleared >= 4, `the records dropped by the clear were reported (${res.cleared})`);
+    // a record recorded after the clear survives it
+    const after = applyAccountStats({ v: STATS_VERSION, records: [accountRecord(11, 9)] }, { key: 'alice', clearedAt: 5 });
+    assert.equal(after.stats.records.length, 1);
+  }));
+
+  test('statsSyncPayload: compact-only, newest first, bounded in BYTES', () => {
+    const stats = manyRecords(40);
+    const payload = statsSyncPayload(stats, 6_000);
+    assert.equal(payload.v, STATS_VERSION);
+    assert.ok(payload.records.length >= 1 && payload.records.length < 40, `bounded: ${payload.records.length}`);
+    assert.equal(payload.records[0].id, stats.records[0].id, 'newest first');
+    assert.ok(payload.records.every((r) => r.compact === true), 'every mirrored record is the compact summary');
+    const bytes = new TextEncoder().encode(JSON.stringify(payload)).length;
+    assert.ok(bytes <= 6_000, `inside the budget: ${bytes}`);
+    // the real budget is what the client sends: a fraction of the local history, still a useful window of matches
+    const full = statsSyncPayload(manyRecords(200));
+    assert.ok(new TextEncoder().encode(JSON.stringify(full)).length <= SYNC_MAX_BYTES);
+    assert.ok(full.records.length > 5, `a useful window of matches (${full.records.length})`);
+  });
+
+  test('the sync state remembers which account got which payload (sp.pref.statsSync)', () => withStorage(() => {
+    assert.equal(statsSyncState(), null, 'nothing handed over yet');
+    const payload = statsSyncPayload(manyRecords(3));
+    const hash = statsFingerprint(payload);
+    assert.match(hash, /^[0-9a-f]{8}$/);
+    setStatsSyncState({ account: 'alice', hash });
+    assert.deepEqual(statsSyncState(), { account: 'alice', hash });
+    assert.notEqual(statsFingerprint(statsSyncPayload(manyRecords(4))), hash, 'a new match changes the digest');
+    setStatsSyncState(null);
+    assert.equal(statsSyncState(), null);
+  }));
+
+  test('an envelope of a newer format on either side is left alone (never downgraded)', () => withStorage(() => {
+    saveStats(manyRecords(2));
+    setStatsOwner('alice');
+    // the account mirror comes from a newer build: nothing is merged and the local copy is untouched
+    const newerIncoming = applyAccountStats({ v: STATS_VERSION + 1, records: [accountRecord(3, 30)] }, { key: 'alice' });
+    assert.equal(newerIncoming.blocked, true);
+    assert.equal(newerIncoming.stats.records.length, 2, 'the local history is kept as it is');
+    // the local copy itself is from a newer build: the account copy must not be written over it either
+    globalThis.localStorage.setItem('sp.pref.stats', JSON.stringify({ v: STATS_VERSION + 1, records: [{ id: 'future', t: 1, players: [{ playerId: 'p1' }] }] }));
+    const newerLocal = applyAccountStats({ v: STATS_VERSION, records: [accountRecord(4, 40)] }, { key: 'alice' });
+    assert.equal(newerLocal.blocked, true);
+    assert.equal(JSON.parse(globalThis.localStorage.getItem('sp.pref.stats')).v, STATS_VERSION + 1, 'still the newer envelope');
+  }));
+
+  test('onStatsChanged fires on every successful write (a finished match, an import, a merge)', () => withStorage(() => {
+    let hits = 0;
+    const off = onStatsChanged(() => { hits += 1; });
+    recordResult(baseResult(), { myId: 'p1', roomMode: 'solo', now: 1 });
+    assert.equal(hits, 1, 'a stored match');
+    applyAccountStats({ v: STATS_VERSION, records: [accountRecord(5, 2)] }, { key: 'alice' });
+    assert.ok(hits >= 2, 'the account merge is a write too');
+    off();
+    const before = hits;
+    saveStats(emptyStats());
+    assert.equal(hits, before, 'unsubscribed listeners stay quiet');
+  }));
 });

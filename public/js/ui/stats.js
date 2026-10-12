@@ -1,7 +1,9 @@
 // Local match statistics: every match the local player took part in is appended as one record to localStorage
-// (`sp.pref.stats`). Per-browser only — the server keeps matches in memory and has no identity, so there is nowhere
-// else for cross-match numbers to live; nothing here is ever sent anywhere. The stats page labels itself 本机数据 and
-// offers JSON export / import for moving between devices. (Ported from PR #323 by @2321Robin, reworked for 0.2.2.)
+// (`sp.pref.stats`). Per-browser storage, with the account extension §account as the only way out of it: a signed-in
+// player's history is mirrored to their account (`stats.push` / `stats.pull` / `stats.clear`, server/stats.js) so
+// another device shows the same numbers, while a 游客's records never leave this browser. The stats page labels
+// itself accordingly 本机数据 / 已同步到账号 and offers JSON export / import for moving between devices by hand.
+// (Ported from PR #323 by @2321Robin, reworked for 0.2.2.)
 //
 // Two kinds of record (`end`):
 //   'settled'  the match reached its settlement: m.result arrived (server/match/results.js buildResult). The record
@@ -34,23 +36,72 @@
 // Pure logic, no Preact / DOM: Node-testable (test/ui/stats.test.js); localStorage is touched only by loadStats /
 // saveStats / their helpers.
 
-import { PHASE } from '../../../shared/constants.js';
+import { PHASE, STATS_VERSION, STATS_MAX_RECORDS } from '../../../shared/constants.js';
 
-/** Current record-envelope version (bump + add a MIGRATIONS step when the record shape changes). */
-export const STATS_VERSION = 1;
+/** Current record-envelope version (shared/constants.js STATS_VERSION: the account mirror and the `stats.*` frames
+ * read the same number, so bump it there — with a MIGRATIONS step here — when the record shape changes). */
+export { STATS_VERSION };
 /** localStorage key under the app's `sp.pref.` prefix (store.js loadPref). */
 export const STATS_PREF_KEY = 'stats';
-/** Oldest records are dropped beyond this many matches. */
-export const MAX_RECORDS = 1000;
+/** Oldest records are dropped beyond this many matches (shared/constants.js STATS_MAX_RECORDS: the protocol check and
+ * the account mirror bound the same number). */
+export const MAX_RECORDS = STATS_MAX_RECORDS;
 /** The newest records that keep their full rows (lineups, bonds, teammates) — what the settlement replay reads. */
 export const FULL_KEEP = 30;
 /** Budget of the stored JSON in characters (a character costs up to 2 bytes of the browser's ~5 MB quota): the oldest records go first. */
 export const MAX_CHARS = 800_000;
 /** Largest export file the page reads. */
 export const IMPORT_MAX_CHARS = 8_000_000;
+/**
+ * Budget of the JSON the account mirror may hold, in BYTES (server/stats.js STATS_MAX_BYTES): what a `stats.push`
+ * frame carries. Kept small on purpose — this frame shares the socket with the 4-second latency probe (ui/statsSync.js
+ * sends it right after a pong) and every push makes the server rewrite `accounts.json`, so the mirror is a window of
+ * ~25 compacted matches rather than everything. The local copy above keeps the whole history.
+ */
+export const SYNC_MAX_BYTES = 16_000;
 
 const FULL_KEY = `sp.pref.${STATS_PREF_KEY}`;
 const DAMAGED_KEY = `${FULL_KEY}.damaged`;
+/** Which account the stored history belongs to (`sp.pref.statsOwner`): see applyAccountStats. */
+const OWNER_KEY = `${FULL_KEY}Owner`;
+/** What this browser last handed to which account (`sp.pref.statsSync`): see statsSyncState. */
+const SYNC_STATE_KEY = `${FULL_KEY}Sync`;
+
+/** @returns {string|null} the account key (lowercased username) the local history belongs to, or null when no account ever claimed it */
+export function statsOwner() {
+  try {
+    const v = globalThis.localStorage?.getItem(OWNER_KEY);
+    return typeof v === 'string' && v ? v : null;
+  } catch { return null; }
+}
+
+/** @param {string|null} key */
+export function setStatsOwner(key) {
+  try {
+    if (key) globalThis.localStorage?.setItem(OWNER_KEY, key);
+    else globalThis.localStorage?.removeItem(OWNER_KEY);
+  } catch { /* ignore */ }
+}
+
+// ---- change notification (the account sync subscribes; ui/statsSync.js) -----------------------------------------
+
+const listeners = new Set();
+
+/**
+ * Follow every successful write of the stored history (a finished match, an import, a clear, an account merge).
+ * @param {() => void} fn
+ * @returns {() => void} unsubscribe
+ */
+export function onStatsChanged(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+function emitStatsChanged() {
+  for (const fn of [...listeners]) {
+    try { fn(); } catch (e) { console.warn('[stats] change listener failed', e); }
+  }
+}
 
 /** @returns {{ v: number, records: Array }} a fresh empty envelope */
 export const emptyStats = () => ({ v: STATS_VERSION, records: [] });
@@ -336,6 +387,7 @@ export function saveStats(stats) {
       const ls = globalThis.localStorage;
       if (!ls) return false; // no storage at all (disabled by the browser)
       ls.setItem(FULL_KEY, JSON.stringify({ v: STATS_VERSION, records: recs }));
+      emitStatsChanged();
       return true;
     } catch { /* quota or storage disabled — fall through to shrinking */ }
     if (recs.length <= 8) return false; // a small history that still does not fit is foreign quota pressure
@@ -634,6 +686,117 @@ export function exportStats(stats) {
     exportedAt: new Date().toISOString(),
     records: fitToBudget(Array.isArray(stats?.records) ? stats.records : []),
   };
+}
+
+// ---- the account mirror (extension §account; server/stats.js is the other half) ------------------------------------
+
+let encoder = null;
+/** UTF-8 byte length, as the wire counts it (falls back to the UTF-16 length where TextEncoder is missing). */
+function byteLength(s) {
+  if (encoder == null && typeof TextEncoder === 'function') encoder = new TextEncoder();
+  return encoder ? encoder.encode(s).length : s.length;
+}
+
+/**
+ * The account's copy of the history: the newest records that fit in `maxBytes` of JSON, ALL of them compacted
+ * (ui/stats.js compactRecord — frame + the player's own summary row, no lineups / bonds / teammates).
+ *
+ * Compact-only is deliberate. The mirror's job is the numbers (aggregates, the history list, the difficulty and
+ * strategy tables) and those read the compact shape; keeping full rows would spend a 7 KB match on what a 600-byte
+ * summary already says, and every byte here is a byte that shares the socket with the latency probe (net.js pings
+ * every 4 s) and costs a rewrite of `accounts.json` on the server. The device that PLAYED a match keeps its full
+ * rows locally (FULL_KEEP), so only a settlement re-viewed from another device is affected — the history row says so.
+ * @param {{ records?: any[] }} stats newest first
+ * @param {number} [maxBytes]
+ * @returns {{ v: number, records: any[] }}
+ */
+export function statsSyncPayload(stats, maxBytes = SYNC_MAX_BYTES) {
+  const records = [];
+  let used = 24; // the envelope itself
+  const all = Array.isArray(stats?.records) ? stats.records : [];
+  for (let i = 0; i < all.length && i < MAX_RECORDS; i++) {
+    const rec = compactRecord(all[i]);
+    const n = byteLength(JSON.stringify(rec)) + 1;
+    if (records.length && used + n > maxBytes) break;
+    used += n;
+    records.push(rec);
+  }
+  return { v: STATS_VERSION, records };
+}
+
+/** Short stable digest of a built payload (ui/statsSync.js keeps it to know what the account already has). */
+export function statsFingerprint(payload) {
+  try { return fnv1a(JSON.stringify(payload)); } catch { return ''; }
+}
+
+/**
+ * `sp.pref.statsSync`: `{ account, hash }` — which account this browser last handed its history to, and a digest of
+ * what it sent (ui/statsSync.js statsFingerprint). It is what keeps a reconnect from re-pushing the whole list: the
+ * account's mirror is bounded (SYNC_MAX_BYTES), so "does the mirror hold all our records?" is always false for a
+ * player with more matches than fit — the question has to be "did WE change since we last handed it over?".
+ * @returns {{ account?: string, hash?: string } | null}
+ */
+export function statsSyncState() {
+  try {
+    const raw = globalThis.localStorage?.getItem(SYNC_STATE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return isObj(o) ? o : null;
+  } catch { return null; }
+}
+
+/** @param {{ account: string, hash: string } | null} state */
+export function setStatsSyncState(state) {
+  try {
+    if (state && state.account && state.hash) globalThis.localStorage?.setItem(SYNC_STATE_KEY, JSON.stringify(state));
+    else globalThis.localStorage?.removeItem(SYNC_STATE_KEY);
+  } catch { /* ignore */ }
+}
+
+/** Records a 清空统计数据 stamped as gone (`t` at or before the stamp) — never merged back. */
+function withoutCleared(stats, clearedAt) {
+  const records = Array.isArray(stats?.records) ? stats.records : [];
+  const kept = Number.isFinite(clearedAt) ? records.filter((r) => !(Number.isFinite(r?.t) && r.t <= clearedAt)) : records;
+  return { v: STATS_VERSION, records: kept };
+}
+
+/**
+ * Merge the account's mirror into the local history — the login / register / stats.pull path.
+ *
+ * Who the local history belongs to decides what happens (extension §account isolation): an account that is not the one
+ * recorded as the owner starts from ITS OWN copy instead of absorbing somebody else's matches (the rule the seat
+ * follows — one account's history never becomes another's). A history no account has claimed yet (a 游客's) is adopted
+ * by the first account that signs in, exactly like the 干员调配 the account takes over on register.
+ *
+ * An envelope of a NEWER format on either side is left alone (`blocked`): this build must never downgrade it, which is
+ * the rule loadStats / importStats follow too (the local copy is not overwritten, the payload is not merged into it).
+ * @param {{ records?: any[] } | null | undefined} payload the account's mirror (null when it has none yet)
+ * @param {{ key?: string|null, clearedAt?: number|null }} [info] verified account key + the last 清空 stamp
+ * @returns {{ stats: { v: number, records: any[] }, added: number, replaced: boolean, cleared: number, blocked: boolean }}
+ *   added = records the local history did not have; replaced = a foreign history was dropped for this account;
+ *   cleared = local records dropped by the 清空 stamp; blocked = a newer-format envelope was left untouched
+ */
+export function applyAccountStats(payload, { key = null, clearedAt = null } = {}) {
+  const local = loadStats();
+  if (local.newer) {
+    console.warn('[stats] local history was written by a newer client: the account copy is not merged into it');
+    return { stats: local, added: 0, replaced: false, cleared: 0, blocked: true };
+  }
+  const migrated = migrateStats(isObj(payload) ? payload : emptyStats());
+  if (migrated.newer) {
+    console.warn('[stats] the account mirror was written by a newer client: keeping the local history as it is');
+    return { stats: local, added: 0, replaced: false, cleared: 0, blocked: true };
+  }
+  const owner = statsOwner();
+  const foreign = !!key && !!owner && owner !== key;
+  const base = withoutCleared(foreign ? emptyStats() : local, clearedAt);
+  const incoming = withoutCleared(migrated.stats, clearedAt);
+  const merged = mergeStats(base, incoming);
+  const have = new Set(base.records.map((r) => r.id));
+  const added = merged.records.filter((r) => !have.has(r.id)).length;
+  saveStats(merged);
+  if (key) setStatsOwner(key);
+  return { stats: merged, added, replaced: foreign, cleared: Math.max(0, local.records.length - (foreign ? 0 : merged.records.length)), blocked: false };
 }
 
 // ---- aggregation (what the page shows; records may hold more than any view uses) ------------------------------------

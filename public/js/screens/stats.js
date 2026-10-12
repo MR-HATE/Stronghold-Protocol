@@ -10,8 +10,10 @@
 //   对局记录  – every stored match, newest first. A settled row re-views that match's settlement screen (the record is
 //               inverted into an m.result payload for <ResultView/>); a match given up early is marked 中途退出 and,
 //               when it did not count, 不计入统计
-// Everything is 本机数据 (localStorage, `sp.pref.stats`) and the page says so, teammates' names included. 导出 / 导入 (a
-// JSON file, merged by record id on the way in) moves it between devices; 清空 resets it after a confirm dialog.
+// Everything lives in localStorage (`sp.pref.stats`) and the page says who that is: a signed-in account's history is
+// mirrored to it (extension §account, ui/statsSync.js — the note reads 已同步到账号), a 游客's never leaves the browser
+// (本机数据, teammates' names included). 导出 / 导入 (a JSON file, merged by record id on the way in) moves it between
+// devices by hand; 清空 resets it after a confirm dialog, the account's copy included.
 // The host renders nothing until opened and the game data files the replay needs load only then (the lobby alone never
 // downloads them): the overview reads config / bands / assets only.
 
@@ -26,6 +28,8 @@ import { useDocClass } from '../ui/device.js';
 import { createStore, useStore, selectRoute } from '../store.js';
 import { ResultView } from './result.js';
 import { toast, toastError } from '../ui/toasts.js';
+import { accountStore } from '../net.js';
+import { clearAccountStats } from '../ui/statsSync.js';
 import {
   loadStats, saveStats, emptyStats, importStats, exportStats, aggregateStats, countsTowardStats, selfRowOf, roundsOf,
   recordToResult, MAX_RECORDS, FULL_KEEP, IMPORT_MAX_CHARS,
@@ -208,7 +212,7 @@ function HistoryRow({ rec, gd, onOpen }) {
   const view = !quit && !rec.compact; // a quit has nothing settled; a compacted record no rows left
   const open = () => onOpen(rec);
   return html`<tr class=${cx(quit ? 'is-quit' : won ? 'is-win' : 'is-lose', !counted && 'is-excluded', view && 'is-clickable')}
-      title=${view ? t('点击查看该局结算') : !counted ? t('没有清完第一个回合就退出，不计入统计') : quit ? t('中途退出的对局没有结算可看') : t('较早的对局只保留汇总，不能回看结算')}
+      title=${view ? t('点击查看该局结算') : !counted ? t('没有清完第一个回合就退出，不计入统计') : quit ? t('中途退出的对局没有结算可看') : t('该记录只保存了汇总，不能回看结算')}
       tabIndex=${view ? 0 : undefined}
       onClick=${view ? open : undefined} onKeyDown=${view ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } } : undefined}>
     <td class="st-t">${dateTime(rec.t)}</td>
@@ -256,6 +260,8 @@ function StatsScreen({ tab }) {
   const replayRef = useRef(null);
   replayRef.current = replay;
   const inMatch = useStore((s) => selectRoute(s) === 'game');
+  // the account this browser is signed into (extension §account): the note line and 清空 follow it
+  const acct = accountStore.read();
   useDocClass('sp-stats-open');
 
   // a match starting (the host pressed 开始) takes the player to its briefing: the overlay must not sit on top of it
@@ -300,14 +306,19 @@ function StatsScreen({ tab }) {
     }
   };
   const doClear = async () => {
+    const acct = accountStore.read();
     const ok = await confirmDialog({
       title: t('清空统计数据'), micro: 'CLEAR STATISTICS', danger: true, okText: t('清空'),
-      text: t('将删除本机保存的 {n} 条对局记录，无法恢复。', { n: stats.records.length }),
+      text: acct
+        ? t('将删除本机保存的 {n} 条对局记录，并清空账号上的同步副本；无法恢复。', { n: stats.records.length })
+        : t('将删除本机保存的 {n} 条对局记录，无法恢复。', { n: stats.records.length }),
     });
     if (!ok) return;
     if (!saveStats(emptyStats())) { try { globalThis.localStorage?.removeItem('sp.pref.stats'); } catch { /* ignore */ } }
     reload();
-    toast(t('已清空本机统计数据'), 'success');
+    // the account's mirror goes too (extension §account): otherwise the next pull would put the records back
+    await clearAccountStats();
+    toast(acct ? t('已清空统计数据（含账号同步副本）') : t('已清空本机统计数据'), 'success');
   };
 
   if (replay) return html`<div class="st st--replay" ref=${boxRef} tabindex="-1" role="dialog" aria-modal="true" aria-label=${t('统计数据')}>
@@ -333,10 +344,12 @@ function StatsScreen({ tab }) {
         <${Button} variant="ghost" size="sm" data-testid="stats-export" disabled=${empty || stats.newer} onClick=${doExport} title=${t('导出为文件（可在别的设备上导入）')}>${t('导出')}<//>
         <${Button} variant="ghost" size="sm" data-testid="stats-import" disabled=${stats.newer} onClick=${() => fileRef.current?.click()} title=${t('从导出的文件导入（与现有记录合并）')}>${t('导入')}<//>
         <input ref=${fileRef} type="file" accept="application/json,.json" hidden onChange=${doFile} />
-        <${Button} variant="secondary" size="sm" data-testid="stats-clear" disabled=${empty || stats.newer} onClick=${doClear} title=${t('清空本机的统计数据')}>${t('清空')}<//>
+        <${Button} variant="secondary" size="sm" data-testid="stats-clear" disabled=${empty || stats.newer} onClick=${doClear} title=${acct ? t('清空本机与账号上的统计数据') : t('清空本机的统计数据')}>${t('清空')}<//>
       </div>
     </header>
-    <p class="st-note"><${Icon} name="info" />${t('本机数据：只保存在这个浏览器里，不会上传到服务器；同盟对局里队友的代号也会存在本机（导出文件里也有）。')}</p>
+    <p class="st-note"><${Icon} name="info" />${acct
+      ? t('已登录 {name}：对局记录会同步到账号，换设备登录后也能看到（账号上保存较新的汇总记录，不能回看结算；本机保留全部）；同盟对局里队友的代号也会随记录一并同步。', { name: acct.username })
+      : t('本机数据：只保存在这个浏览器里，不会上传到服务器；同盟对局里队友的代号也会存在本机（导出文件里也有）。')}</p>
     ${stats.damaged ? html`<p class="st-note is-warn"><${Icon} name="warn" />${t('本机保存的统计数据无法读取，已另存为备份，从现在起重新记录。')}</p>` : null}
     ${stats.dropped ? html`<p class="st-note is-warn"><${Icon} name="warn" />${t('有 {n} 条记录已损坏，已忽略。', { n: stats.dropped })}</p>` : null}
     <main class="st-body" data-tab=${tab}>

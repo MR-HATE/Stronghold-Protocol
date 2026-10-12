@@ -58,6 +58,12 @@ export const loadoutStore = createStore({
   diySync: 'idle',
 });
 
+/**
+ * The flush of the loadout sync once `installLoadoutSync` has wired it (see flushLoadout).
+ * @type {(() => Promise<void>) | null}
+ */
+let activeLoadoutFlush = null;
+
 /** Replace the stored entries (persisted at once with the settings; the sync picks the change up). */
 export function setEntries(entries) {
   const next = entries && typeof entries === 'object' ? entries : {};
@@ -173,11 +179,14 @@ function installPrefSync({ net, timers, target, notify, key, stateKey, msgType, 
   let lastSent = null;    // JSON of the last payload the server accepted (on this session)
   let edited = false;     // an edit is waiting to be sent (a lock refusal is then worth telling the player)
   let disposed = false;
+  /** Paused while this browser is a 游客 (see pauseLoadoutSync): nothing is sent, so a cleared local copy cannot
+   * reach — and overwrite — the account the session may still be bound to for a moment. */
+  let paused = false;
 
   const setState = (sync) => { if (target.get()[stateKey] !== sync) target.set({ [stateKey]: sync }); };
 
   const schedule = (ms = SYNC_DEBOUNCE_MS) => {
-    if (disposed) return;
+    if (disposed || paused) return;
     T.clearTimeout(timer);
     setState('pending');
     timer = T.setTimeout(() => { timer = null; void flush(); }, ms);
@@ -187,7 +196,7 @@ function installPrefSync({ net, timers, target, notify, key, stateKey, msgType, 
   // the frames in order, so the newest payload always wins; holding the edit until the previous reply arrived let a
   // click right after closing the overlay (准备就绪 → INFO_CHECK ends) overtake it, and the edit silently missed the match.
   async function flush() {
-    if (disposed) return;
+    if (disposed || paused) return;
     if (net.status !== 'online') { setState('idle'); return; } // the next welcome resends
     try {
       const payload = await prepare();
@@ -240,6 +249,11 @@ function installPrefSync({ net, timers, target, notify, key, stateKey, msgType, 
 
   return {
     flush,
+    /** Stop (or restart) sending on behalf of the current local copy — the 游客 transition, see pauseLoadoutSync. */
+    setPaused(on) {
+      paused = !!on;
+      if (paused) { T.clearTimeout(timer); timer = null; }
+    },
     dispose() {
       disposed = true;
       T.clearTimeout(timer);
@@ -249,6 +263,28 @@ function installPrefSync({ net, timers, target, notify, key, stateKey, msgType, 
     },
   };
 }
+
+/** The pause switch of the sync `installLoadoutSync` wired (see pauseLoadoutSync / resumeLoadoutSync). */
+let activeLoadoutPause = null;
+
+/**
+ * The flush of the sync `installLoadoutSync` wired (main.js calls it once at boot), so a caller that changed the
+ * stored 干员调配 can push it now instead of waiting for the debounce — the title screen does that when the local
+ * loadout is reset as the player leaves their account for 游客 play (title.js enterAsGuest).
+ * @returns {Promise<void>}
+ */
+export function flushLoadout() { return activeLoadoutFlush ? activeLoadoutFlush() : Promise.resolve(); }
+
+/**
+ * Stop sending `room.loadout` for a while. The title screen pauses it when the browser becomes a 游客: the local
+ * copy is cleared, and that empty copy must never be written to the account a still-bound session might hold. A
+ * later sign-in resumes it (resumeLoadoutSync), after the account's own copy has been applied locally.
+ * @param {boolean} [on]
+ */
+export function pauseLoadoutSync(on = true) { activeLoadoutPause?.(on); }
+
+/** Resume sending after pauseLoadoutSync (the account's 干员调配 is local again and may be pushed to the session). */
+export function resumeLoadoutSync() { activeLoadoutPause?.(false); }
 
 /**
  * Wire the loadout sync once. Dependencies are injectable for tests.
@@ -262,7 +298,7 @@ export function installLoadoutSync({ net, getChessReady, getBackupsReady, lookup
   const lookup = lookupChess || ((id) => data.lookup('chess', id));
   // the operators a 潜能 / 练度 may name (shared/protocol.js cultivationCharIds: the roster + the 自选 owned pool)
   const opIds = operatorIds || (() => cultivationCharIds(data.get('chess'), data.get('backups')));
-  return installPrefSync({
+  const sync = installPrefSync({
     net, timers, target, notify, key: ['entries', 'ops'], stateKey: 'sync', msgType: 'room.loadout', field: null, tag: 'loadout',
     lockedText: N_('本局的干员调配已锁定，修改将在下一局生效'),
     async prepare() {
@@ -281,6 +317,9 @@ export function installLoadoutSync({ net, getChessReady, getBackupsReady, lookup
       return { entries, ops: sanitizeOps(target.get().ops, (id) => ids.has(id)) };
     },
   });
+  activeLoadoutFlush = sync.flush;
+  activeLoadoutPause = sync.setPaused;
+  return { flush: sync.flush, dispose() { sync.dispose(); } };
 }
 
 /**
