@@ -422,7 +422,6 @@
   "剩余{remain}秒": "{remain}s remaining",
   "确认": "Confirm",
   "加载中": "Loading",
-  "网络延迟 {ms}ms（最近几秒的最低值，不含本机卡顿）": "Network latency {ms}ms (lowest of the last few seconds, this device's own stalls excluded)",
   "未连接": "Not connected",
   "正在同步同盟状态…": "Syncing Alliance state…",
   "服务器已更新，本局结束后刷新": "The server was updated. The page will refresh after this match",
@@ -1258,5 +1257,6 @@
   "账号已失效": "Account no longer valid",
   "服务器上已经没有这个账号（账号数据被清空或换了服务器）。请重新登录或注册。": "This account is no longer on the server (its data was wiped, or the server was replaced). Please sign in or register again.",
   "本机的干员调配与统计数据还在：用同一个账号名重新注册就能传回账号。": "This device still has your operator loadout and statistics: register the same account name again to send them back to the account.",
-  "重新登录 / 注册": "Sign in / register again"
+  "重新登录 / 注册": "Sign in / register again",
+  "当前延迟 {ms}ms": "Current latency: {ms}ms"
 }
