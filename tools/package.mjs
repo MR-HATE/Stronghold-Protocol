@@ -106,7 +106,7 @@ export const PLAYER_NPM_SCRIPTS = ['start', 'setup', 'doctor', 'launch', 'postin
 /** Markdown copied into the zip. Relative links to anything else are rewritten at stage time. */
 export const PLAYER_MARKDOWN = [...ROOT_FILES, ...PLAYER_DOCS].filter((f) => f.endsWith('.md'));
 /** Where a packaged doc link points when the file itself is not in the zip. */
-export const GITHUB_REPO = 'https://github.com/sganggs/Stronghold-Protocol';
+export const GITHUB_REPO = 'https://github.com/MR-HATE/Stronghold-Protocol_With_account_and_sync';
 
 /**
  * THE SWITCH for the Japanese voice dub in the full zip (`audio.voiceJp` of data/assets.json: 2674 files under
