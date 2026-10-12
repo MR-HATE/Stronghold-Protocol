@@ -18,6 +18,20 @@
 
 English summary: [below](#english).
 
+## 本 fork 新增（相对上游）
+
+本仓库是 [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol) 的 fork：**游戏本体、规则、数值与文档都来自上游，上游内容一律保留**，下面是本 fork 自己加的可选功能。上游已在 [#268](https://github.com/sganggs/Stronghold-Protocol/issues/268) 说明「不做账号和云存档」，所以这些改动只在 fork 里维护，不向上游提合并。
+
+- **账号与数据同步（可选）**：注册 / 登录后**账号名就是游戏内代号**（标题页不再另填代号）；干员调配（技能 / 模组、潜能 · 练度）与对局统计绑定账号，换设备、换浏览器或服务器重启都不会丢；**同一个账号在另一台设备登录会接回原来的座位**并还原进行中的对局（受与断线重连相同的时间窗限制，服务器重启后房间即结束），而不同账号的对局互不相通——在别人的账号座位上登录不会接手那一局。**不登录照样可以直接玩，未配置账号存储时行为与上游完全一致**；账号**不是访问控制**。
+  - 存档是一个 `accounts.json`，**刻意放在仓库之外**（环境变量 `ACCOUNTS_DIR`，默认开服机器的用户目录），更新游戏不会动它。Docker 部署要把它挂出来，否则重建容器会清空账号（见 [docs/DEPLOY.md](docs/DEPLOY.md)）。
+  - 服务器上已经没有这个账号时，客户端会提示「账号已失效」并要求重新登录 / 注册（用同一个账号名重新注册，本机的干员调配与统计数据会传回新账号），不会静默变成游客。
+  - 同步的对局统计是**较新的汇总记录**（不能回看结算，本机保留完整历史），游客的记录永不上传。
+- **游客登录提示**：未登录点「开始」先说明登录能同步什么（可以「以游客身份继续」，也可以勾「不再提示」），不会把登录表单直接弹到脸上。
+- **延迟胶囊显示口径**：胶囊数字改为「最近几秒的最低往返」，不再把本机页面卡顿算成网络延迟；控制台可以用 `__SP__.net.ping`（显示值）与 `__SP__.net.pingLast`（最近一次原始采样）对照。
+- **实现说明**：[docs/FORK_NOTES.md](docs/FORK_NOTES.md)（改动清单）、[docs/design/network.md](docs/design/network.md) §8.1（协议与账号规则）。
+
+同步上游：本 fork 定期合并上游 `master`（`git remote add upstream https://github.com/sganggs/Stronghold-Protocol.git && git fetch upstream && git merge upstream/master`）。
+
 | 同盟房间 | 策略轮选 | 休整期（商店 / 盟约） |
 |---|---|---|
 | ![房间](docs/img/room.jpg) | ![策略](docs/img/band-draft.jpg) | ![休整期](docs/img/prep.jpg) |
@@ -26,7 +40,7 @@ English summary: [below](#english).
 
 ## 目录
 
-- [声明](#声明) · [简介](#简介) · [功能一览](#功能一览)
+- [声明](#声明) · [本 fork 新增](#本-fork-新增相对上游) · [简介](#简介) · [功能一览](#功能一览)
 - [快速开始](#快速开始)：[整合包](#方式一整合包推荐) · [从源码运行](#方式二从源码运行) · [系统要求](#系统要求) · [端口与配置](#端口与配置) · [局域网联机](#和朋友一起玩局域网)
 - [联机方式](#联机方式) · [操作](#操作) · [文档](#文档) · [开发与测试](#开发与测试) · [项目结构](#项目结构)
 - [许可证](#许可证) · [致谢与数据来源](#致谢与数据来源) · [贡献](#贡献)
@@ -53,7 +67,7 @@ English summary: [below](#english).
 - **联防**：有人漏怪、又有人完美作战时，完美作战的队友带着阵容帮忙拦截漏掉的敌人。
 - **最终攻势与隐秘核心**：两人共享一个战场，全队共同削减同一条领袖血条；10 个敌方领袖，巨型领袖约 5×3 格的受击范围，以及官方的限伤规则。
 - **结算称号**：卫戍之星、不朽盟约、坚若磐石等 6 个称号。
-- **账号（可选，本仓库新增）**：注册或登录后，**账号名就是你游戏内的博士代号**——标题页不再要求另填代号；干员调配（技能 / 模组、潜能 · 练度）绑定账号，换设备、换浏览器或服务器重启都不会丢；**对局也跟着账号走**：同一个账号在另一台设备登录会接回原来的座位并还原进行中的对局（与断线重连同样受时间窗限制，服务器重启后房间即结束），而不同账号的对局互不相通——在别人的账号座位上登录不会接手那一局；**统计数据**也同步到账号（账号上是较新的汇总记录、不能回看结算，本机保留全部；游客不上传）。不登录照样可以直接玩。
+- **账号（可选）**：注册或登录后，**账号名就是你游戏内的博士代号**——标题页不再要求另填代号；干员调配（技能 / 模组、潜能 · 练度）绑定账号，换设备、换浏览器或服务器重启都不会丢；**对局也跟着账号走**：同一个账号在另一台设备登录会接回原来的座位并还原进行中的对局（与断线重连同样受时间窗限制，服务器重启后房间即结束），而不同账号的对局互不相通——在别人的账号座位上登录不会接手那一局；**统计数据**也同步到账号（账号上是较新的汇总记录、不能回看结算，本机保留全部；游客不上传）。不登录照样可以直接玩。
 - **断线重连**：同盟模拟断线后 10 分钟内重新打开页面即可回到原座位，掉线期间按原阵容自动作战，也可以「暂离」交给 AI 托管；独立模拟 24 小时内可以回来继续（同一个浏览器）。
 - **交互细节**：漏怪时顶栏的目标生命值实时减少（结算时确定）；点选、拖放和配发装备都按地上的方格；购买、升级和机变选卡都需要点两次确认；只有一名玩家时除作战外不计时。
 - **画面与声音**：真实 Spine 小人、官方 BGM 与音效、表情（6 套 × 6 个）、作战特效；可选的官方 3D 棋盘（需要从本机客户端提取贴图）。
@@ -255,6 +269,7 @@ An **unofficial, non-commercial fan remake** of Arknights' seasonal auto-chess t
 - **Run:** download the full bundle `Stronghold-Protocol-v<version>.zip` (~505 MB, all the art inside, the Chinese and Japanese operator voices included) from [Releases](../../releases/latest) — or the lite one, `…-lite.zip` (~22 MB), which downloads the art (~550 MB) on its first start; from 0.2.1 on, `…-update.zip` holds only the files changed since the earlier 0.2.x releases: stop the server, extract it over an existing 0.2.x folder and start again (the first start deletes the files the new version dropped and verifies the install) — install Node.js 22 or 24, then double-click `scripts\start-windows.bat` (Windows) or run `./scripts/start.sh` (macOS / Linux) and open <http://localhost:3000>. From source: `npm install && npm run setup && npm start` (setup downloads ~550 MB of art from public mirrors, the emotes and the how-to-play pages included; the official 3D board, some official HUD icons, two enemy models and 39 summon models are extracted from a local Arknights client — without one the game uses the 2D board and look-alike stand-ins (the summons show their avatars), and a server can copy `public/assets/local/` and `data/local-assets.json` from the full bundle of the same version).
 - **Languages:** Chinese (the default), English, 日本語, 한국어 and 繁體中文 — switch on the title screen or in Settings. Game texts come from the official clients; the Japanese, Korean and Traditional Chinese interface strings are machine translations (corrections welcome: [docs/I18N.md](docs/I18N.md)).
 - **Play with friends:** create a co-op room and share the 4-letter key or the `?room=KEY` link. On a LAN, use the address printed at start; otherwise use a virtual-LAN tool, a tunnel or a VPS — see [docs/DEPLOY.md](docs/DEPLOY.md).
+- **This fork adds (not upstream):** an optional account layer — register / sign in, the account name is your in-game name, the operator loadout and match statistics follow the account, and signing in on another device rejoins your seat and restores a running match (different accounts never inherit each other's rooms). Without it the game is exactly upstream: no account store, nothing sent, guests can still play. `accounts.json` lives outside the repository (`ACCOUNTS_DIR`) — on Docker mount it, or a rebuilt container loses the accounts. Upstream decided not to include accounts ([#268](https://github.com/sganggs/Stronghold-Protocol/issues/268)); see [docs/FORK_NOTES.md](docs/FORK_NOTES.md).
 - **Disclaimer:** not affiliated with or endorsed by Hypergryph or Yostar. All Arknights names, art, audio, text and data are © their respective owners and are **not** covered by this project's GPL licence. For study and personal non-commercial use only — no selling, paid distribution, paid servers or monetisation of any kind. Content will be removed on request of the rights holders. Provided "as is", without warranty.
 - **License:** code GPL-3.0-or-later ([LICENSE](LICENSE)); game assets excluded.
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) (an English summary at its end); the code map is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
