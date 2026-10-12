@@ -5,8 +5,21 @@
 //   detects dead sockets (a ping left unanswered — no inbound frame at all — for DEAD_AFTER_MS ⇒
 //   close ⇒ reconnect). Measured from the oldest unanswered ping, not from the last inbound frame,
 //   so a background tab whose timers the browser throttles to ~1/min is not mistaken for dead.
+// - The latency the UI shows (`ping`) is the LOWEST round trip of the recent window (PING_WINDOW_MS), not the
+//   last one: a single sample is `receive - send` measured on the page's own thread, so it also counts every
+//   millisecond the page spent busy before it got around to the pong (simulating a battle, a long render, a
+//   throttled tab) — a 66 ms server measured 164 ms on a page in a match. A stall only ever ADDS to a sample,
+//   so the window's minimum is the path's latency; `pingLast` keeps the newest raw sample for diagnosis
+//   (`__SP__.net.ping` / `__SP__.net.pingLast` in the console). The official client shows 当前延迟
+//   (research 06 §3.4) because it can measure off-thread; this is the closest honest equivalent in a page.
 // - On every (re)connect, once a player name is known, sends `hello {name, token, version}`;
-//   the session is "online" after `welcome`.
+//   the session is "online" after `welcome`. A logged-in account (accountStore, extension §account)
+//   sends `hello {account, token, version}` with NO name: the account username is the in-game name and
+//   the server resolves it (it may be longer than the callsign limit), so `name` is optional in the
+//   frame. The `welcome` carries the verified name. A `welcome` WITHOUT `accountName` means the server did not
+//   accept the credential (its account store was wiped or replaced): the bearer is forgotten (the username stays
+//   for the login form) and `accountRejected` records it, so the app asks the player to sign in again instead of
+//   playing on as the 游客 session that hello fell back to (main.js onWelcome — 不放行).
 // - `request(t, fields)` adds a `rid` and resolves on the matching `ok` (or any reply carrying the
 //   rid), rejects with a NetError on `error` or after REQUEST_TIMEOUT_MS. Requests made while
 //   reconnecting are queued and flushed after `welcome` (still bound by their timeout).
@@ -36,6 +49,15 @@ import { N_ } from '../../shared/i18n.js';
 export const REQUEST_TIMEOUT_MS = 8000;
 export const HELLO_TIMEOUT_MS = 8000;
 export const PING_INTERVAL_MS = 4000;
+/**
+ * How far back the displayed latency looks (net.js `_onPong`): the lowest round trip of the samples inside this
+ * window is the path's latency. A sample is measured on the page's own thread, so a busy page (a battle being
+ * simulated, a long render) inflates it; a stall only ever adds, so the minimum is the honest number. ~4 samples at
+ * PING_INTERVAL_MS, which keeps up with a real change in the path within seconds.
+ */
+export const PING_WINDOW_MS = 15_000;
+/** Safety cap on the samples kept for that window (a throttled tab can leave few, a burst can leave many). */
+const PING_SAMPLES_MAX = 32;
 export const DEAD_AFTER_MS = 15000;
 export const BACKOFF = Object.freeze({ base: 500, factor: 2, max: 10000, jitter: 0.2 });
 
@@ -142,7 +164,13 @@ export class Net {
     this.playerId = null;
     this.attempt = 0;          // consecutive failed connection attempts
     this.retryAt = 0;          // epoch ms of the next reconnect attempt (0 = none)
-    this.ping = null;          // last RTT in ms
+    this.ping = null;          // displayed latency: the lowest round trip inside PING_WINDOW_MS (the path's)
+    this.pingLast = null;      // the newest raw round trip, page stalls included (diagnosis: __SP__.net.pingLast)
+    /** @type {null | { username: string }} set by the last `welcome` when it did not confirm the account this
+     * `hello` presented (the server's store was wiped / replaced); read by the welcome handler, cleared every hello */
+    this.accountRejected = null;
+    /** @type {{ at: number, rtt: number }[]} the samples `ping` is taken from, oldest first */
+    this._pingSamples = [];
     this.lastError = null;     // last NetError relevant to the connection (e.g. hello rejected)
     this.clockOffset = 0;
     this.clockSynced = false;
@@ -295,13 +323,17 @@ export class Net {
     this._unansweredSince = null;
     this.retryAt = 0;
     this._startHeartbeat();
-    if (this.name) {
+    // A logged-in account alone is enough to open a session (the server resolves its username).
+    if (this.canHello()) {
       this._setStatus('handshaking');
       this._sendHello();
     } else {
       this.attempt = 0;
       this._setStatus('connected');
       this._sendPing();
+      // The account extension's auth.* frames may be queued before any name/account exists (the title screen logs
+      // in on a machine that never played): the server accepts them without a session, so send them now.
+      this._flushQueue();
     }
   }
 
@@ -318,7 +350,7 @@ export class Net {
       this._emit('replaced', this.lastError);
       return;
     }
-    if (ev && ev.code === CLOSE_HELLO_TIMEOUT && !this.name && this.status === 'connected'
+    if (ev && ev.code === CLOSE_HELLO_TIMEOUT && !this.canHello() && this.status === 'connected'
         && this.now() - this._openedAt >= QUIET_SWAP_MIN_AGE_MS) {
       // Idle pre-hello socket dropped by the server: replace it without a visible status change.
       this._quietSwap = true;
@@ -363,10 +395,33 @@ export class Net {
 
   // ---- handshake -------------------------------------------------------------------------------
 
+  /**
+   * The callsign to put in `hello`, or null when a logged-in account opens the session instead.
+   *
+   * A logged-in player's in-game name IS the account username (server/lobby.js accountHello), and a username may
+   * be longer than the protocol's callsign limit — so the client sends no name at all and lets the server fill in
+   * the verified one. `hello.account` is what authorises that. A 游客 (guestStore) is never named by the account,
+   * even when this browser still remembers one.
+   * @returns {string|null}
+   */
+  helloCandidateName() {
+    if (accountTokenForHello()) return null;
+    return this.name || null;
+  }
+
+  /** Whether a `hello` can be sent at all (a callsign, or an account token that supplies the name). */
+  canHello() {
+    return !!accountTokenForHello() || !!this.name;
+  }
+
   _sendHello() {
-    if (!this.name) return;
+    const acct = accountStore.read();
+    const account = accountTokenForHello();
+    const name = this.helloCandidateName();
+    if (!account && !name) return;
     const rid = this._nextRid();
-    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION };
+    const msg = { t: 'hello', rid, version: PROTOCOL_VERSION };
+    if (name) msg.name = name;
     let token = null;
     try { token = this.getToken(); } catch { token = null; }
     if (typeof token === 'string' && token.length > 0 && token.length <= 64) {
@@ -375,9 +430,20 @@ export class Net {
       if (claim?.noReplace) msg.noReplace = true;
       if (Number.isFinite(claim?.claimAt)) msg.claimAt = claim.claimAt;
     }
+    // Account token (extension §account; separate from the reconnect token): persists across server restarts and
+    // binds the saved 干员调配. A username that does not fit `hello.name` still rides along as a hint; the server
+    // resolves the token and uses its own username, so the hint is never trusted.
+    if (account) {
+      msg.account = account;
+      if (acct.username) msg.accountName = acct.username;
+    }
     this._helloToken = token;
     this._helloRid = rid;
-    this._helloSentName = this.name;
+    this._helloSentName = name;
+    // Remember that this hello spoke for an account, so `welcome` can be checked against it: the server answers an
+    // account hello with `accountName` only when it could resolve the token (lobby.js accountHello), and a token it
+    // does not know is ignored on purpose so a stale entry still enters the game — as a 游客 (see _onWelcome).
+    this._helloSentAccount = account || null;
     if (this.status !== 'handshaking') this._setStatus('handshaking');
     if (!this._sendRaw(msg)) return;
     this._clearTimer('_helloTimer', 'clearTimeout');
@@ -402,10 +468,32 @@ export class Net {
     this.playerId = msg.playerId ?? null;
     this.attempt = 0;
     this.lastError = null;
+    // A credential the server did not accept — its account store was wiped or replaced (a rebuilt container without
+    // the ACCOUNTS_DIR volume), or the account was never there. `welcome` then carries no `accountName`, and because
+    // an account hello sends no callsign either, the session it opens is a 游客's named 博士 (the DEFAULT_NAME). Drop
+    // the dead bearer instead of presenting it on every reconnect, and record the fact: the welcome handler keeps the
+    // player out of that session and asks them to sign in again (main.js) rather than letting them play on as a guest.
+    const sentAccount = this._helloSentAccount;
+    this._helloSentAccount = null;
+    this.accountRejected = sentAccount && !msg.accountName ? this._forgetRejectedAccount(sentAccount) : null;
     if (Number.isFinite(msg.serverNow)) this._addClockSample(msg.serverNow + (this.ping ?? 0) / 2 - this.now(), Infinity);
     this._setStatus('online');
     this._flushQueue();
     this._sendPing();
+  }
+
+  /**
+   * Forget the account token the server did not accept, keeping the username for the login form, and return what the
+   * welcome handler needs to say. The seat this session had still belongs to that account key and a later login of the
+   * same account comes back to it (lobby.js); nothing else about the session changes.
+   * @param {string} token the token this hello presented
+   * @returns {{ username: string }}
+   */
+  _forgetRejectedAccount(token) {
+    const acct = accountStore.read();
+    const username = acct && acct.token === token ? acct.username : '';
+    accountStore.forget();
+    return { username };
   }
 
   _onHelloError(msg) {
@@ -445,9 +533,13 @@ export class Net {
         reject(new NetError('BAD_MSG', bad));
         return;
       }
-      // Queue while a session is being (re)established; fail fast when none can come.
+      // Queue while a session is being (re)established; fail fast when none can come. The account extension's
+      // auth.* frames are the one exception: the title screen sends them on a machine that has no name (and no
+      // session) yet, and the server accepts them there on purpose (server/net.js mints a throwaway session).
+      const authRequest = typeof t === 'string' && t.startsWith('auth.');
       const establishing = this.status === 'connecting' || this.status === 'handshaking' || this.status === 'reconnecting';
-      if (this.status !== 'online' && !(establishing && this.name && !this._manualClose)) {
+      const queued = this.status === 'connected' && authRequest && !this._manualClose; // socket open, no name yet
+      if (this.status !== 'online' && !(establishing && (authRequest || this.name) && !this._manualClose) && !queued) {
         reject(new NetError(this._manualClose ? 'CLOSED' : 'OFFLINE'));
         return;
       }
@@ -463,7 +555,9 @@ export class Net {
         reject(new NetError('TIMEOUT'));
       }, timeout);
       this._pending.set(rid, entry);
-      if (this.status === 'online') entry.sent = this._sendRaw(msg);
+      // An open socket may satisfy the request right away: `online` (a session exists), or a queued auth.* frame
+      // on a socket that has no name yet — the server takes those without a session.
+      if (this.status === 'online' || (queued && this.ws?.readyState === WS_OPEN)) entry.sent = this._sendRaw(msg);
     });
   }
 
@@ -614,7 +708,15 @@ export class Net {
     if (!Number.isFinite(c)) return;
     const rtt = now - c;
     if (!(rtt >= 0 && rtt < 60000)) return;
-    this.ping = Math.round(rtt);
+    this.pingLast = Math.round(rtt);
+    // The displayed latency is the window's minimum (see PING_WINDOW_MS): this sample also carries whatever the page
+    // was busy with, and the page's own delay must not be reported as the server being slow.
+    this._pingSamples.push({ at: now, rtt });
+    if (this._pingSamples.length > PING_SAMPLES_MAX) this._pingSamples.shift();
+    while (this._pingSamples.length > 1 && now - this._pingSamples[0].at > PING_WINDOW_MS) this._pingSamples.shift();
+    let best = this._pingSamples[0].rtt;
+    for (const s of this._pingSamples) if (s.rtt < best) best = s.rtt;
+    this.ping = Math.round(best);
     if (Number.isFinite(msg.s)) this._addClockSample(msg.s + rtt / 2 - now, rtt);
     this._emit('ping', this.ping);
     this._emit('status', this.snapshot());
@@ -963,6 +1065,92 @@ export function createIdentity(deps = {}) {
 
 /** Browser identity singleton (main.js awaits `identity.init()` before connecting). */
 export const identity = createIdentity({ onYield: () => net.reconnectNow(net.helloName || net.name) });
+
+/**
+ * Account (username + token) persistence — the account extension §account.
+ *
+ * Distinct from `identity` (the per-tab reconnect token): the account token is a long-lived bearer for the human
+ * behind the screen. It survives server restarts and is what makes the username the in-game name (server/lobby.js
+ * accountHello), carries the saved 干员调配 across tabs and devices, and lets the same account resume its seat
+ * from another device. localStorage (not sessionStorage) on purpose — the same person on a second browser logs in
+ * rather than re-picking a callsign.
+ */
+const ACCT_KEY = 'sp.account';
+const isAcctToken = (v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
+
+export const accountStore = {
+  /** @returns {{ token: string, username: string } | null} */
+  read() {
+    try {
+      const raw = globalThis.localStorage?.getItem(ACCT_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (o && isAcctToken(o.token) && typeof o.username === 'string') return o;
+    } catch { /* ignore */ }
+    return null;
+  },
+  /** @param {{ token: string, username: string }} a */
+  write(a) {
+    if (!a || !isAcctToken(a.token) || typeof a.username !== 'string') return;
+    try { globalThis.localStorage?.setItem(ACCT_KEY, JSON.stringify({ token: a.token, username: a.username })); } catch { /* ignore */ }
+  },
+  clear() {
+    try { globalThis.localStorage?.removeItem(ACCT_KEY); } catch { /* ignore */ }
+  },
+  /**
+   * Drop the bearer but remember the username: the server did not accept this credential (its account store was
+   * wiped / replaced — net.js `_accountRejected`), so presenting it again would only repeat the refusal, while the
+   * login form still prefills who this browser was playing as (`lastUsername`). A later login writes both back.
+   */
+  forget() {
+    const acct = this.read();
+    try {
+      if (acct) globalThis.localStorage?.setItem(ACCT_KEY, JSON.stringify({ username: acct.username }));
+      else globalThis.localStorage?.removeItem(ACCT_KEY);
+    } catch { /* ignore */ }
+  },
+  /** The username of the last account used on this browser, also after `forget()` ('' when there is none). */
+  lastUsername() {
+    try {
+      const o = JSON.parse(globalThis.localStorage?.getItem(ACCT_KEY) || 'null');
+      return o && typeof o.username === 'string' ? o.username : '';
+    } catch { return ''; }
+  },
+};
+
+/**
+ * 游客 marker (the account extension's counterpart): this browser plays WITHOUT an account, deliberately.
+ *
+ * It lives here, next to the account store, because the transport is what must honour it: a 游客's `hello`
+ * carries no account token even while an account is still remembered, so logging out keeps a callsign session
+ * instead of silently restoring the account. `title.js` sets it (enterAsGuest / the account actions).
+ */
+const GUEST_KEY = 'sp.guest';
+
+export const guestStore = {
+  /** @returns {boolean} */
+  read() {
+    try { return globalThis.localStorage?.getItem(GUEST_KEY) === '1'; } catch { return false; }
+  },
+  /** @param {boolean} on */
+  write(on) {
+    try {
+      if (on) globalThis.localStorage?.setItem(GUEST_KEY, '1');
+      else globalThis.localStorage?.removeItem(GUEST_KEY);
+    } catch { /* quota / privacy mode */ }
+  },
+};
+
+/**
+ * The account token a `hello` may present, or null: a 游客 sends none, which is what makes "log out and keep
+ * playing" real — the session then belongs to the callsign, not to the account.
+ * @returns {string|null}
+ */
+function accountTokenForHello() {
+  if (guestStore.read()) return null;
+  const acct = accountStore.read();
+  return acct && acct.token ? acct.token : null;
+}
 
 /** Browser connection singleton (created lazily-safe: nothing touches the network until connect()). */
 export const net = new Net({ getToken: () => identity.getToken(), getTokenClaim: () => identity.getTokenClaim() });

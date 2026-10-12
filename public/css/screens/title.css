@@ -256,6 +256,37 @@
 html[data-script="alphabetic"] .title-login .btn--xl { letter-spacing: .3em; }
 .title-conn .ping { height: max(.26rem, 1.6em); font-size: calc(.15 * var(--t)); }
 
+/* ---- account (extension §account: register / login modal, and the account name as the in-game 代号) --------- */
+.title-account { display: flex; align-items: center; justify-content: center; gap: .12rem; margin-top: .1rem; font-size: calc(.12 * var(--t)); }
+.title-account__me { color: #8fb8a8; }
+.title-account__link { background: none; border: none; color: #4ed8af; cursor: pointer; font-size: calc(.12 * var(--t)); text-decoration: underline; padding: 0; font-family: inherit; }
+.title-account__link:hover { color: #7be8c4; }
+/* Logged in: the callsign field is replaced by the account name (read-only), with the same box metrics. */
+.title-account-name { text-align: left; }
+.title-account-name .field__box { border-color: rgba(78, 216, 175, .35); }
+.title-account-name__value { flex: 1; min-width: 0; font-size: calc(.26 * var(--t)); font-weight: 700; letter-spacing: .04em; color: var(--text-hi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title-account-name__note { flex: none; font-size: calc(.13 * var(--t)); font-weight: 400; color: var(--text-dim); }
+
+.auth-modal { position: fixed; inset: 0; background: rgba(8, 14, 12, .7); display: grid; place-items: center; z-index: 100; -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
+.auth-modal__box { width: min(360px, 90vw); background: #111614; border: 1px solid #2c3a35; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.auth-modal__box h3 { margin: 0; color: #d8e3de; font-size: calc(18px * var(--t)); }
+.auth-modal__box p { margin: 0; font-size: calc(12px * var(--t)); color: #8fb8a8; }
+.auth-modal__row { display: flex; justify-content: space-between; gap: .1rem; font-size: calc(12px * var(--t)); }
+.auth-modal__link { background: none; border: none; color: #4ed8af; cursor: pointer; font-size: calc(12px * var(--t)); text-decoration: underline; padding: 0; font-family: inherit; }
+.auth-modal__link:hover { color: #7be8c4; }
+/* 密码 field with its 显示 / 隐藏 toggle pinned inside the box (the input keeps right padding for it). */
+.auth-pass { position: relative; display: flex; }
+.auth-pass .field { flex: 1; min-width: 0; }
+.auth-pass .field__input { padding-right: calc(48px * var(--t)); }
+.auth-pass__toggle { position: absolute; right: .1rem; bottom: .09rem; height: .38rem; padding: 0 .08rem; background: none; border: 0; color: #4ed8af; cursor: pointer; font-size: calc(12px * var(--t)); font-family: inherit; }
+.auth-pass__toggle:hover { color: #7be8c4; }
+
+/* 游客 login nudge (title.js start): what an account keeps in sync, before a guest enters without one. */
+.title-nudge p { margin: 0 0 .1rem; font-size: calc(.15 * var(--t)); line-height: 1.7; color: var(--text-hi); }
+.title-nudge p.t-lo { margin-bottom: .12rem; font-size: calc(.13 * var(--t)); }
+.title-nudge__off { display: inline-flex; align-items: center; gap: .08rem; font-size: calc(.14 * var(--t)); color: var(--text-lo); cursor: pointer; user-select: none; }
+.title-nudge__off input { width: max(14px, .16rem); height: max(14px, .16rem); margin: 0; accent-color: var(--mint-500); cursor: pointer; }
+
 .title-foot {
   position: absolute;
   z-index: 2;

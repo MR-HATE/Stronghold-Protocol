@@ -36,7 +36,7 @@ import { useErrorBoundary } from '../vendor/hooks.module.js';
 import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/components.js';
 import { ConnectionBanner } from './ui/connBanner.js';
 import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
-import { net, identity, NetError } from './net.js';
+import { net, identity, NetError, accountStore } from './net.js';
 import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
 import { data } from './data.js';
 import { GAME_FILES } from './ui/gameComponents.js';
@@ -51,6 +51,7 @@ import { installDeviceSupport } from './ui/device.js';
 import { LoadoutHost } from './screens/loadout.js';
 import { StatsHost } from './screens/stats.js';
 import { recordResult, installStatsRecorder } from './ui/stats.js';
+import { installStatsSync } from './ui/statsSync.js';
 import { installLoadoutSync, installOwnershipSync, installDiySync } from './ui/loadoutSync.js';
 import { startBuildGuard } from './ui/buildGuard.js';
 import { initLang, useLang, tickerText } from './ui/lang.js';
@@ -147,12 +148,28 @@ function backToLobby() {
 function onWelcome(msg) {
   identity.saveToken(msg.token);
   identity.rememberMatch(null);
+  // This hello presented an account the server no longer knows (net.js forgot the dead bearer already): the session
+  // it opened is a 游客's — named 博士, because an account hello carries no callsign.
+  const rejected = net.accountRejected;
   const prev = store.get();
   const prevId = prev.me.playerId;
   const name = typeof msg.name === 'string' && msg.name ? msg.name : prev.me.name;
-  identity.saveName(name);
-  store.set({ me: { playerId: msg.playerId ?? null, name, token: typeof msg.token === 'string' ? msg.token : null } });
+  // Never remember the server's fallback name as this browser's callsign.
+  if (!rejected) identity.saveName(name);
+  store.set({ me: { playerId: msg.playerId ?? null, name: rejected ? prev.me.name : name, token: typeof msg.token === 'string' ? msg.token : null } });
   welcomeAt = Date.now();
+
+  if (rejected) {
+    // 不放行. The account is gone, so the player has to sign in or register again — do not let them play on inside a
+    // guest session that looks signed in (that is the bug this branch exists for). Back to the title screen
+    // (selectRoute: not entered → title) with the notice, which offers 重新登录 / 注册 and 以游客身份继续; the socket
+    // stays open, so `auth.login` / `auth.register` adopt this session and rename it to the verified username.
+    backToLobby();
+    identity.setEntered(false);
+    store.set({ session: { entered: false } });
+    store.patch('ui', { accountExpired: { username: rejected.username } });
+    return;
+  }
 
   if (prevId != null && prevId !== msg.playerId) {
     // A brand-new server session (the server restarted — crashed / killed, so no room.closed arrived — or this session
@@ -199,8 +216,11 @@ function onRoomState(msg) {
 
 const CLOSE_REASON = {
   // 'timeout' = this player was removed after staying disconnected past the lobby grace (server/lobby.js)
+  // 'account' = another account signed in on this session: the seat was not that account's, so it was left
+  // behind (extension §account, server/lobby.js releaseForeignSeat) — the room / match on screen is stale.
   host_left: N_('创建者已离开，同盟已解散'), timeout: N_('由于长时间断开连接，你已离开同盟'), empty: N_('同盟已解散'),
-  kicked: N_('你已被移出同盟'), ended: N_('模拟已结束'), expired: N_('同盟已过期'), shutdown: N_('服务器维护中，同盟已关闭'),
+  kicked: N_('你已被移出同盟'), account: N_('你已切换账号，原同盟与对局已留在原账号名下'),
+  ended: N_('模拟已结束'), expired: N_('同盟已过期'), shutdown: N_('服务器维护中，同盟已关闭'),
 };
 
 function wireNet() {
@@ -360,6 +380,14 @@ async function boot() {
 
   wireNet();
   installStatsRecorder(store); // follows the match on screen, so a 放弃模拟 can be recorded (ui/stats.js)
+  // 对局统计 × the account (extension §account): push the local history to the signed-in account and pull its mirror
+  // back on every welcome (ui/statsSync.js). A 游客 never sends anything; a match on screen defers the exchange, and it
+  // goes out in the quiet window after a pong, so the frame never shares the queue with the latency probe.
+  installStatsSync({
+    net,
+    getAccount: () => accountStore.read(),
+    isBusy: () => selectRoute(store.get()) === 'game',
+  });
   installLoadoutSync({ net });
   installOwnershipSync({ net });
   installDiySync({ net });
