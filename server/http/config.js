@@ -4,9 +4,12 @@
 //   * TRUST_PROXY ('auto' default: honour CF-Connecting-IP / X-Real-IP / X-Forwarded-For only from loopback/private
 //     peers such as a local cloudflared; '1' always; '0' never) → net.js trustProxy;
 //   * DEBUG → the console logger's debug level;
+//   * ACCOUNTS_DIR → where the optional account store keeps `accounts.json` (extension §account; default
+//     `<home>/data` — deliberately OUTSIDE the repository, so updating the game never touches the accounts);
 //   * the served directories (public/, data/, shared/ and the content packs' packs/ of this repository unless the
 //     options name others), and which startServer() options are handed on to net.js Network and lobby.js Lobby.
 
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +22,20 @@ export const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 const NET_OPTION_KEYS = ['reconnectWindowMs', 'heartbeatMs', 'helloTimeoutMs', 'ratePerSec', 'rateBurst', 'maxConnections', 'abuseDropsPerSec',
   'maxConnectionsPerAddr', 'heavyPerSec', 'heavyBurst', 'trustProxy'];
 const LOBBY_OPTION_KEYS = ['lobbyGraceMs', 'maxRooms', 'maxRoomsPerAddr', 'maxMatchesPerAddr', 'resyncMinGapMs', 'soloReconnectWindowMs'];
+
+/** Where the account store lives when neither the `accountsDir` option nor ACCOUNTS_DIR says otherwise. */
+export const DEFAULT_ACCOUNTS_DIR = path.join(os.homedir(), 'data');
+
+/**
+ * The account store's directory (extension §account): the `accountsDir` startServer() option, else ACCOUNTS_DIR, else
+ * DEFAULT_ACCOUNTS_DIR. Kept out of the repository on purpose — a `git pull` / bundle update must never touch it.
+ * @param {{ accountsDir?: string }} [opts]
+ * @returns {string}
+ */
+export function accountsDirFrom(opts = {}) {
+  const explicit = opts.accountsDir || process.env.ACCOUNTS_DIR;
+  return explicit ? path.resolve(explicit) : DEFAULT_ACCOUNTS_DIR;
+}
 
 /**
  * Bind address used when neither the `host` option nor `HOST` says otherwise: one dual-stack socket, so the server

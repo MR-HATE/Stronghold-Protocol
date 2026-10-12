@@ -1,7 +1,7 @@
 // Normative message catalogue (DESIGN §8). Used by server (validation) and client (building requests).
 // Every client→server message is `{ t, rid?, ...fields }`. Unknown `t` or invalid fields ⇒ ERR.BAD_MSG.
 
-import { DIFFICULTIES, NAME_MAX_LEN, ROOM_CODE_LEN, MAX_SEATS, EMOTES, GEO } from './constants.js';
+import { DIFFICULTIES, NAME_MAX_LEN, ROOM_CODE_LEN, MAX_SEATS, EMOTES, GEO, STATS_VERSION, STATS_MAX_RECORDS } from './constants.js';
 import { isDroppableChess } from './standIn.js';
 import { diySlotIds, validateDiyPicks } from './diy.js';
 import { cultivatedStats, isPotential, isCultivate, POTENTIAL_DEFAULT, CULTIVATE_DEFAULT } from './potential.js';
@@ -375,11 +375,50 @@ const target = (v) => {
   return false;
 };
 
+/**
+ * Structural check of a `stats.push` payload (account extension §account): `{ v, records }` with the current
+ * STATS_VERSION, a bounded record count and every record carrying an id. The record FIELDS are the client's own
+ * schema (public/js/ui/stats.js normalizeRecord); the server only unions records by id, so it validates the shape it
+ * relies on and bounds the size (server/stats.js) — never the whole payload field by field, which would duplicate
+ * that schema on this side.
+ * @param {any} v
+ * @returns {boolean}
+ */
+export function isStatsPayload(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  if (v.v !== STATS_VERSION) return false;
+  if (!Array.isArray(v.records) || v.records.length > STATS_MAX_RECORDS) return false;
+  return v.records.every((r) => !!r && typeof r === 'object' && !Array.isArray(r)
+    && typeof r.id === 'string' && r.id.length > 0 && r.id.length <= 64);
+}
+
 /** @type {Record<string, Record<string, (v:any)=>boolean> & { $optional?: string[] }>} */
 export const C2S = {
-  // session & lobby
-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6),
-    noReplace: isBool, claimAt: (v) => isNum(v, 0, Number.MAX_SAFE_INTEGER), $optional: ['token', 'version', 'noReplace', 'claimAt'] },
+  // session & lobby.
+  // hello.name is OPTIONAL: a logged-in client opens its session with the account token alone — the verified
+  // account username (≤ 24 chars, server/accounts.js) becomes the name and need not fit the callsign limit.
+  // server/net.js requires a non-empty name only from a frame that carries no account token.
+  hello: { name: (v) => v == null || isStr(v, NAME_MAX_LEN), token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6),
+    noReplace: isBool, claimAt: (v) => isNum(v, 0, Number.MAX_SAFE_INTEGER),
+    // account extension (§account): the token issued by auth.register / auth.login, and the username as a hint
+    // only — the server resolves the token and uses ITS username, so a spoofed one is ignored
+    account: (v) => v == null || isStr(v, 64), accountName: (v) => v == null || isStr(v, NAME_MAX_LEN),
+    $optional: ['name', 'token', 'version', 'noReplace', 'claimAt', 'account', 'accountName'] },
+  // account extension (§account): the title screen logs in before it has a session. Answered with `auth.result`
+  // { ok, token, username, loadout, ops } (net.js dispatchReply) — never the generic `ok`.
+  'auth.register': { username: (v) => typeof v === 'string' && /^[a-zA-Z0-9_\-.]{2,24}$/.test(v), password: (v) => typeof v === 'string' && v.length >= 4 && v.length <= 128 },
+  'auth.login': { username: (v) => typeof v === 'string' && /^[a-zA-Z0-9_\-.]{2,24}$/.test(v), password: (v) => typeof v === 'string' && v.length >= 1 && v.length <= 128 },
+  // leave the account without leaving the session: the session stops carrying (and writing to) the account, so a
+  // 游客 keeps playing as the callsign and the account's saved 干员调配 is left untouched. Idempotent; `ok`.
+  'auth.logout': {},
+  // account extension (§account): the local 对局统计 (public/js/ui/stats.js) — `stats.push {stats}` merges the
+  // client's envelope into the account's mirror (union by record id, bounded; server/stats.js), `stats.pull` asks for
+  // that mirror back (answered `stats.sync {stats}` instead of a bare `ok`, net.js dispatchReply) and `stats.clear`
+  // drops it (with a stamp that keeps other devices from re-uploading what was cleared). A 游客's frames are no-ops:
+  // nothing is stored without an account token.
+  'stats.push': { stats: isStatsPayload },
+  'stats.pull': {},
+  'stats.clear': {},
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },

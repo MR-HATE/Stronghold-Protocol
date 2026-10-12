@@ -19,7 +19,23 @@ export const MAX_SEATS = 4;
  */
 export const MAX_SPECTATORS = 2;
 export const ROOM_CODE_LEN = 4;
+/** Max length of a player name (`hello.name`, net.js sanitizeName). A callsign may be this long; an ACCOUNT username
+ * is longer (24, server/accounts.js USERNAME_RE), so a logged-in client does not put its username here — it sends no
+ * name at all and the verified account username becomes the session name (server/lobby.js accountHello). */
 export const NAME_MAX_LEN = 12;
+/** Name a session falls back to when the client sends none (a logged-in account whose token this server could not
+ * resolve, e.g. after the account store was reset). Not a player choice: the UI shows 博士 for an unnamed player too. */
+export const DEFAULT_NAME = N_('博士');
+
+/**
+ * Version of the local 对局统计 record envelope (public/js/ui/stats.js `STATS_VERSION`, the account mirror in
+ * server/stats.js and the `stats.*` frames of the account extension): the client bumps it with a migration step, the
+ * server only ever stores the version it knows and refuses a newer one.
+ */
+export const STATS_VERSION = 1;
+/** Hard cap on the records one stats envelope may carry (public/js/ui/stats.js MAX_RECORDS): the protocol check and
+ * the account mirror's bound both read it, so the client's own list bound is the single source of truth. */
+export const STATS_MAX_RECORDS = 1000;
 
 export const DIFFICULTIES = ['FUNNY', 'NORMAL', 'HARD', 'ABYSS'];
 export const DIFFICULTY_NAMES = { FUNNY: N_('标准模拟'), NORMAL: N_('险境模拟'), HARD: N_('绝境模拟'), ABYSS: N_('终极模拟') };
