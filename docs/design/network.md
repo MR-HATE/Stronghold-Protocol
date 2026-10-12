@@ -10,7 +10,7 @@ Transport: one WebSocket per tab at `/ws`, JSON text frames `{ t: '<type>', ...p
 C→S: `hello {name, token?, version}` · `room.create {mode:'solo'|'coop', difficulty}` · `room.join {code}` · `room.leave` · `room.ready {ready}` · `room.setDifficulty {difficulty}` (host) · `room.setAiPicksLast {on}` (host, co-op, before the match — `ROOM_STARTED` during it, `BAD_TARGET` in a solo room; un-readies the other humans like a difficulty change; the match takes it as `opts.aiPicksLast`: humans draft before AI seats, off by default, no extra random draw) · `room.addBot` / `room.removeBot {seat}` (host) · `room.kick {seat, playerId}` (host, before the match: another human leaves the room and gets `room.closed {reason:'kicked'}`; may join again; `playerId` = the player the host confirmed, a seat that changed hands meanwhile → `BAD_TARGET`) · `room.start` (host) · `room.loadout {entries, ops?}` (§16: any time in the lobby / room and during INFO_CHECK, then `WRONG_PHASE`; heavy rate-limit bucket; the match exposes it as `m.private.loadout`; `ops` — 0.2.2 — the per-operator 潜能 / 练度 `{ [charId]: { potential?: 1–6, cultivate?: 0–3 } }` of the 干员调配 roster and the 自选 owned pool, ≤ 256, checked strictly with the entries, `m.private.ops`; absent = none set: every operator 潜能 6, 精英2 Lv.60) · `room.ownership {notOwned}` (0.2.0 补位, the 干员持有 tab: the base chess ids marked as not owned — ≤ 160 ids, kept leniently: anything but a droppable NORMAL chess is dropped; stored on the session and the seat, a match takes the seat's list when it starts and never changes it — during a match `ROOM_STARTED` 'stored for the next match'; heavy bucket; the match exposes it as `m.private.standIns`) · `room.diy {picks}` (0.2.0 自选编队: `{ [slotBaseId]: { charId, skillIndex?, uniEquipId? } | null }` for the four DIY slots — ≤ 8 entries, kept leniently: shared/protocol.js `checkDiyPicks` drops an illegal pick (an operator without a kit, another tier's prototype, a prototype off its locked skill, a module of another game mode (集成战略 / 生息演算), an owned operator's second slot, the same operator twice in a tier, an unknown slot), only malformed picks are `BAD_MSG`; stored on the session and the seat like the not-owned list, a match takes the seat's picks when it starts — during a match `ROOM_STARTED` 'stored for the next match'; heavy bucket; the match exposes them as `m.private.diy`) · `ping {c}`
 S→C: `welcome {playerId, token, name, serverNow}` · `room.state {code, hostId, mode, difficulty, aiPicksLast, seats:[{seat, playerId, name, isBot, ready, connected}|null ×4]}` · `room.closed {reason}` · `pong {c, s}` · `error {rid?, code, msg}` · `ok {rid}`
 
-Platform additions (implemented): `welcome.{resumed, version}`, `welcome.diyKitted` (0.2.0: the operators a 自选 slot may field — server/sim/content/kits/index.js `KITTED_CHARS`, the picker's list), `room.state.inMatch`, `error.detail`; `room.closed.reason ∈ 'timeout'|'kicked'|'empty'|'shutdown'` (`kicked`: room.kick / room.removeSpectator; `empty`: a spectator whose room lost its last player); WebSocket close codes 4001 (session taken over by another socket — client must not auto-reconnect), 4002 (no hello in time), 1008 (flooding), 1001 (shutdown). The host's `room.start` counts as the host being ready. After any (re)`hello` the server pushes `room.state` and, if a match runs, the match resends `m.public`/`m.private` (+`m.field`, or the field's `b.start` under client-side combat). **Reconnect window:** a dropped session stays resumable for 10 min (`net.js NET_DEFAULTS.reconnectWindowMs`; co-op seats keep playing their last lineup meanwhile, §6.6); a session that drops while its **solo** room's match runs stays resumable for the official `config.constants.singleReconnectTime` (86 400 s = 24 h; lobby option `soloReconnectWindowMs`; research 01 §1 "24小时内随时返回") — the untimed solo run simply waits. Only when the window expires does the drop become `match.onLeave` (co-op: 中途退出 = elimination; solo: the run ends `'abandoned'`). The client keeps its token in sessionStorage plus a recent-token list in localStorage, so reopening the tab resumes. Everything lives in server memory: a server restart ends every room and run. The lobby⇄match interface (constructor opts, `start/handle/onDisconnect/onReconnect/onLeave/dispose`) is documented verbatim at the top of `server/match/Match.js` and is normative. `server/data.js` provides `getData()` + index getters (`getChess`, `getBond`, `getGarrison`, `getItem`, `getBand`, `getEffect`, `getEnemy`, `getWave`, `getStage`, `getBoss`, `getToken`, `getConfig`, `getMode`). Note: the skill trigger rule lives at `chess.skill.trigger.rule` in data.
+Platform additions (implemented): `welcome.{resumed, version}`, `welcome.diyKitted` (0.2.0: the operators a 自选 slot may field — server/sim/content/kits/index.js `KITTED_CHARS`, the picker's list), `room.state.inMatch`, `error.detail`; `room.closed.reason ∈ 'timeout'|'kicked'|'empty'|'account'|'shutdown'` (`kicked`: room.kick / room.removeSpectator; `empty`: a spectator whose room lost its last player; `account`: another account signed in on this session, §account); WebSocket close codes 4001 (session taken over by another socket — client must not auto-reconnect), 4002 (no hello in time), 1008 (flooding), 1001 (shutdown). The host's `room.start` counts as the host being ready. After `welcome` (which answers the hello and carries the verified account name, §account) the server pushes `room.state` and, if a match runs, the match resends `m.public`/`m.private` (+`m.field`, or the field's `b.start` under client-side combat); the resync MUST follow `welcome`, because the client arms its post-resume restore grace on the welcome and counts only the frames after it as fresh (public/js/main.js `RESTORE_GRACE_MS`) — a resync that arrives first is treated as stale and dropped again a moment later. **Reconnect window:** a dropped session stays resumable for 10 min (`net.js NET_DEFAULTS.reconnectWindowMs`; co-op seats keep playing their last lineup meanwhile, §6.6); a session that drops while its **solo** room's match runs stays resumable for the official `config.constants.singleReconnectTime` (86 400 s = 24 h; lobby option `soloReconnectWindowMs`; research 01 §1 "24小时内随时返回") — the untimed solo run simply waits. Only when the window expires does the drop become `match.onLeave` (co-op: 中途退出 = elimination; solo: the run ends `'abandoned'`). The client keeps its token in sessionStorage plus a recent-token list in localStorage, so reopening the tab resumes. Everything lives in server memory: a server restart ends every room and run. The lobby⇄match interface (constructor opts, `start/handle/onDisconnect/onReconnect/onLeave/dispose`) is documented verbatim at the top of `server/match/Match.js` and is normative. `server/data.js` provides `getData()` + index getters (`getChess`, `getBond`, `getGarrison`, `getItem`, `getBand`, `getEffect`, `getEnemy`, `getWave`, `getStage`, `getBoss`, `getToken`, `getConfig`, `getMode`). Note: the skill trigger rule lives at `chess.skill.trigger.rule` in data.
 
 **Spectator seats** (a remake feature — the official room has none; community report #26, owner's decision 2026-10-04; the spectator-seat subsection of §23): `room.spectate {code}` takes one of a co-op room's `MAX_SPECTATORS` (2) spectator seats, in its lobby or during its match; `room.removeSpectator {playerId}` (host, at any time — the room screen's strip and, once the match runs, the game screen's 观战席 capsule in the top bar, GitHub #120) frees one (`room.closed {reason:'kicked'}` to it, no match frame after it); `room.state.spectators: [{playerId, name, connected}]` (still pushed while the match runs). A spectator is never a player (not in `seats`, not counted for the start, never host, keeps no room alive — `room.closed {empty}` when the last human leaves), receives the room's broadcasts and watches like an eliminated player (`Match.addSpectator`: `b.start` watch / `m.field`, never `m.private`); it may only `g.watch`, leave, and store a `room.loadout` — anything else answers `error SPECTATOR`. Its seat is kept and given back on reconnect like a player's.
 
@@ -20,6 +20,117 @@ welcome stamp sends `claimAt`. When that session is already connected to a diffe
 stamp than the attached holder causes `SESSION_IN_USE` before the old socket is touched. A same-stamp own reconnect
 can still replace its previous socket. Omitted hints retain legacy behavior; they are not authentication. Client
 selection/stamp rules live in design/client.md. In-flight protection requires the updated server as well as client.
+
+**Account extension (§account — a fork addition, `server/accounts.js`; optional, off when no store is configured).**
+`hello` also accepts `account` (the 64-hex token issued by `auth.register` / `auth.login`) and `accountName` (a hint
+the server never trusts); `hello.name` becomes optional (a name is required only from a frame without a token), because
+the username is the in-game name and a username is longer (24) than `NAME_MAX_LEN` (12). `auth.register {username,
+password}` and `auth.login {username, password}` may be sent before `hello` (the title screen has no session yet —
+net.js mints a provisional placeholder session for these frames, flagged `Session.provisional`: the next `hello` runs
+its normal identity lookup as if the socket had none, and reuses the placeholder when nothing matched, so a login on a
+second device can still reach the account's seat); they answer `auth.result {ok, token, username, loadout, ops}` instead
+of the generic `ok`, with `BAD_MSG` for a refused login / a bad shape and `ALREADY` for a taken username. The store
+holds `accounts.json` (scrypt + per-user salt, atomic writes) in `ACCOUNTS_DIR` (default `<home>/data`, i.e. outside
+the repository, so updating the game never touches it).
+
+**One bearer per account.** The token is issued once and every later `login` returns the same one (a record without a
+token gets one on its next login). That is what makes the seat portable: the lobby resolves the token to the account
+and then to the session holding that account's seat, so signing in from a second device lands on the seat the first
+one holds. A token rotated per login would strand it — the first device would keep the seat with a dead token and
+lose its verified name to the next `hello`. It is a password-equivalent secret with no revocation and no device list
+(the extension is deliberately not a full auth system).
+
+**The seat follows the account.** `SessionRegistry.byAccountMap` maps the account KEY (lowercased username) → the
+session holding its seat, and net.js asks the lobby (`sessionForAccount`, a synchronous `AccountStore.lookupToken`
+against the in-memory store) before it mints a session for a `hello { account }` frame. So the same account opening
+the game elsewhere — another tab, browser or device, after a real password login — resumes that session and its
+running match: `welcome.resumed` is set and the ordinary reconnect path re-pushes `room.state` plus the match state
+(`Match.onReconnect`, or the result replay in the lobby) exactly as a reloaded tab does, while the old socket is
+closed with 4001. The reconnect windows bound it as they bound any resume (10 min; a solo run 24 h) and everything
+lives in server memory (a restart ends the run). The account's frame is allowed to replace a connected holder
+(`noReplace` / `claimAt` are skipped when the hello carries an account), so merely opening the game as a signed-in
+account takes that account's seat over.
+
+The lobby resolves the token in `onHello` — which net.js awaits **before** sending `welcome`, so the verified name
+travels in the first frame and no rename is ever broadcast. A verified account: (a) sets `session.name` to its
+username, overriding whatever the frame asked for (no name spoofing; a client cannot take another account's name);
+(b) binds the session to the account key in `SessionRegistry.byAccountMap` (see above); (c) pulls the account's saved
+`loadout` / `ops`, and every later `room.loadout` is written back to it. An unknown / revoked token is inert: it is
+detached from the session (its account map entry is released, but `session.accountKey` stays — the seat still belongs
+to that account), the frame's own name (or `DEFAULT_NAME` when it sent none) stands, and the player still enters.
+`welcome.accountName` (via the lobby's `welcomeInfo(session)`) carries the verified name — which makes a `welcome`
+WITHOUT it the client's signal that the credential it presented was not accepted (an account hello sends no callsign,
+so such a session is a 游客's named 博士). The client then forgets the dead bearer (the username stays, for the login
+form) and REFUSES to play on: `net.accountRejected` makes the welcome handler drop back to the title screen with the
+账号已失效 dialog, which offers 重新登录 / 注册 (prefilled with that username) and 以游客身份继续
+(`public/js/net.js _forgetRejectedAccount`, `main.js onWelcome`, `screens/title.js`) — a session that looks signed in
+must never be handed to the player as if nothing happened. A rebuilt server with no `ACCOUNTS_DIR` volume wipes its
+account store (`docs/DEPLOY.md` §3), which is exactly how a browser that remembered an account meets this. Registering
+the same username again recovers the local 干员调配 and 对局统计 (both are keyed by account key, and the empty mirror
+is filled by the first push).
+
+**Isolation — a seat is restored only into the account that took it.** Every session carries `accountKey`: the account
+identity its seat belongs to, assigned when a verified account is adopted and never handed to another. Whenever an
+account is verified on a session — `auth.login` / `auth.register` attach it there, and `accountHello` does it for the
+token a `hello` carries — a session whose `accountKey` differs is released first (`Lobby.dropForeignSeat` →
+`releaseForeignSeat`): a permanent departure, `room.leave`-style — a lobby seat is freed, a running match is told
+`onLeave`, and the client receives `room.closed {reason:'account'}` so no stale room / match screen outlives it, with no
+window between a login and the hello that follows. The new account then starts in the lobby, and its own saved
+`loadout` / `ops` are untouched (they belong to the account, not to the seat). One account's room or match can
+therefore never be restored into another's, in either direction. A guest seat (nobody's account) is left behind too:
+the server cannot tell "the same player registering after guest play" from "another person at the same browser", and
+the isolation rule wins.
+
+**游客 (guest):** logging out of an account on the title screen does not log the player back in on the next page
+load. The client keeps a `sp.guest` marker (`public/js/net.js guestStore`); while it is set, `hello` carries the
+callsign and **no** account token even if one is still remembered, the in-game name is the callsign again, and the
+account's 干员调配 is dropped locally (`title.js enterAsGuest` clears entries / `ops`) so guest play neither inherits
+nor overwrites the account's tuning. The detach happens in the right order: the client first sends `auth.logout`
+(answered `ok`), which clears `session.accountToken`/`accountName` on the server — the account store is only ever
+written through that token, so the account keeps its saved copy — and only then clears the local copy and pushes the
+empty one to the now-guest session; the loadout sync is paused meanwhile (`loadoutSync.pauseLoadoutSync`) and resumed
+by the next sign-in. `auth.logout` is idempotent and needs no account on the server. Signing in (or entering as the
+remembered account) clears the marker. Entering while already signed in needs no password and answers with a notice
+instead of a second login. The seat itself stays what it was: `auth.logout` leaves `session.accountKey` (and the
+account's session binding) in place, so the account that logged out may come back to that seat — from this browser or
+another device — while any other account signing in on the session still leaves it behind (Isolation, above).
+
+**对局统计 mirror.** The local statistics (public/js/ui/stats.js) follow the account too: `stats.push {stats}` unions the
+client's envelope into the account's mirror (`server/stats.js`: by record id, newest first, a full record beating a
+compacted one, bounded to `STATS_MAX_BYTES` = 16 KB / `STATS_MAX_RECORDS`), `stats.pull` asks for it back and is answered
+`stats.sync {stats, clearedAt}` instead of a bare `ok` (net.js `dispatchReply`), and `stats.clear` drops it and stamps
+the moment — a device that still holds the cleared matches drops them on its next pull (`clearedAt` is a lower bound on
+the timeline) instead of pushing them back. `auth.result` carries the mirror as well (`stats`, `statsClearedAt`), so a
+login shows the account's matches before the first pull. Push and pull are heavy rate-limit bucket intents (a ≤ 16 KB
+frame in, the mirror back out). Nothing is stored without an account token: a 游客's frames are no-ops and its records
+never leave the browser. What travels are COMPACTED records only (`compactRecord`: frame + the player's own summary row,
+no lineups / bonds / teammates) — the mirror's job is the numbers, and every byte shares the socket with the client's
+4-second latency probe. The client half is `public/js/ui/statsSync.js`: a debounced push after a local change, a pull
+after every `welcome`, and both wait for the quiet window right after a `pong` (and are deferred entirely while a match
+is on screen). A push is skipped when this browser already handed that exact payload over — the digest in
+`sp.pref.statsSync`, keyed by account — because the mirror is bounded, so "the account is missing our older records" is
+always true for a player with more matches than fit and is not a reason to spend the frame; an account whose mirror
+comes back EMPTY is handed the history again (a wiped or replaced store). Which account a browser's history belongs to is
+stored with it (`sp.pref.statsOwner`): the same account unions with it, a different account starts from its OWN copy
+instead of adopting somebody else's matches, and a history no account has claimed yet is adopted by the first account
+that signs in — the same rule the seat and the 干员调配 follow. This is the only way statistics leave the browser, so the
+stats page says which case it is in (已登录 {name} / 本机数据), and a record that only travelled as a summary says so
+where the settlement replay would be offered.
+
+**Never create an account's copy as empty:** `AccountStore.saveLoadout` ignores a write whose entries and `ops` are
+both empty when the account has nothing stored yet — that is a session that has not received the account's copy (or a
+stray reset), not a deliberate blank 干员调配. Clearing a copy that exists stays possible (the deliberate reset, through
+a session the account was already written on). This is what keeps a client whose local copy went empty from wiping an
+account it has not synced with.
+
+**What the latency pill shows.** The heartbeat is a client-side `ping` every `PING_INTERVAL_MS` (4 s) answered by `pong
+{c, s}`; the round trip it yields is measured on the page's own thread, so it also contains every millisecond the page
+was busy before it handled the pong — a browser simulating a match reported 164 ms to a server whose path was 66 ms
+(43 ms ICMP, measured from the same machine; the official client can measure off-thread and shows 当前延迟, research 06
+§3.4). A stall only ever ADDS to a sample, so the number the pill shows is the LOWEST round trip inside
+`PING_WINDOW_MS` (15 s, net.js `_onPong`) — the path's latency — while the newest raw sample stays available as
+`net.pingLast` (`__SP__.net.ping` / `__SP__.net.pingLast` in the console). The dead-socket watchdog is unaffected: it
+counts unanswered pings from the send side (`DEAD_AFTER_MS`).
 
 ### 8.2 Match
 C→S (all carry `rid`): `g.infoReady {setupRevision?}` · `g.band {bandId}` · `g.bandSkip` · `g.bandFocus {bandId?}` (the strategy highlighted in the draft screen — what a timed-out turn takes; absent / null clears it; `WRONG_PHASE` outside BAND_DRAFT, `ALREADY` after the pick, `BAD_TARGET` for a band not allowed; §18.2) · `g.buy {slot}` · `g.refresh` · `g.freeze` · `g.levelUp` · `g.sell {uid}` · `g.move {uid, to:{area:'board', row, col}|{area:'hand', idx}, dir?}` · `g.equip {itemUid, targetUid, replaceUid?}` (`replaceUid`: which equipped item a third one replaces, §6.2) · `g.art {itemUid, row, col, dir?}` (`dir` ∈ UP|RIGHT|DOWN|LEFT from the deploy wheel, §3; absent ⇒ `to.dir`, then RIGHT; `g.move` onto the piece's own tile re-orients it; board pieces in `m.private` / `m.field {prep:true}` carry `dir`) · `g.destroy {uid}` (hand / temp items only; equipped items are locked, §6.2) · `g.reward {idx}` · `g.choice {idx, choiceId?}` (with an ID: the recipient's PREP personal choice; without one: the public SP_DRAFT; stale or wrong IDs never fall through to the public draft) · `g.ready {ready}` · `g.emote {id}` · `g.watch {fieldId, playerId?}` (`playerId`: the player tapped — a shared 联防 / boss pair field shows two; what an eliminated viewer follows, §25) · `g.autoplay {on}` · `g.pause {on}` (solo battles only, §14 Solo pause) · `g.unitStats {seq?}` (ROUND_START / SP_DRAFT / PREP, else `WRONG_PHASE`; eliminated: `ELIMINATED`) → push `m.unitStats` (§18.5) · `g.leave`

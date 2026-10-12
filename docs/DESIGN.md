@@ -36,3 +36,16 @@ normative lines it rewrote).
 | §27 | [history/0.2.2.md](history/0.2.2.md) | 0.2.2 — after the 0.2.1 release (2026-10-09) |
 | §28 | [history/0.2.3.md](history/0.2.3.md) | 0.2.3 — after the 0.2.2 release (2026-10-10) |
 | §29 | [history/0.2.4.md](history/0.2.4.md) | 0.2.4 — after the 0.2.3 release (2026-10-11) |
+
+**Fork additions** (not in the upstream releases; each is optional and self-contained): the account extension
+(§account) — a username/password account whose name is the in-game name and which carries the 干员调配 across
+devices, in `server/accounts.js` + the `auth.*` / `hello { account }` rules of [design/network.md](design/network.md)
+§8.1. Its store lives outside the repository (`ACCOUNTS_DIR`), and a server without it plays exactly as upstream does.
+The account also owns its **seat**: the same account signing in on another device/tab resumes the session holding its
+current 同盟 / running 对局 (the ordinary reconnect resync, bounded by the same reconnect windows — 10 min, a solo run
+24 h — and lost by a server restart, as every room is), and a seat is restored **only** into the account that took it:
+signing in as a different account on a session leaves that room / match behind (`room.closed {reason:'account'}`)
+instead of inheriting it. The account also mirrors the **对局统计** ([design/network.md](design/network.md) §8.1
+`stats.*`, `server/stats.js`, `public/js/ui/statsSync.js`): a signed-in player's history is unioned into the account and
+pulled back on any device (the mirror is a bounded window of the newest matches, the browser keeps all of them), a
+游客's never leaves the browser, and a history recorded under another account is replaced rather than adopted.

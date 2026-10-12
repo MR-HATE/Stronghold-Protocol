@@ -125,12 +125,13 @@ class Client {
     this.shots += 1;
   }
 
-  /** Title → lobby with a callsign. */
+  /** Title → lobby with a callsign. A 游客 passes the account nudge first (title.js start; switchable off there). */
   async enter(name) {
     await this.page.waitForSelector('.title-login input', { timeout: 20000 });
     await this.click('.title-login input'); // fresh profile per client: the field starts empty
     await this.page.keyboard.type(name);
     await this.click('.title-login button', '开始');
+    await this.click('.modal__actions button', '以游客身份继续', { optional: true, timeout: 5000 });
   }
 
   // ---- field view helpers (render engine debug hooks) ------------------------------------------------------------

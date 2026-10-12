@@ -244,6 +244,65 @@ describe('static import graph resolves', () => {
 
 const mod = (rel) => import(pathToFileURL(path.join(PUBLIC, 'js', rel)).href);
 
+/** The vendored preact the browser loads (public/vendor, written by tools/vendor.mjs). */
+const preact = () => import(pathToFileURL(path.join(PUBLIC, 'vendor/preact.module.js')).href);
+
+/**
+ * A minimal DOM node preact can render into: attribute writes and child insertion are recorded, so an assertion
+ * can inspect the real vnode tree a component produced (see the TextField type test).
+ * @param {string} tag @returns {any}
+ */
+function fakeDomNode(tag) {
+  const node = {
+    tag, attrs: {}, children: [], parent: null, nodeType: 1, data: null,
+    ownerDocument: null, childNodes: null, style: {},
+    setAttribute(k, v) { node.attrs[k] = v; }, removeAttribute(k) { delete node.attrs[k]; },
+    addEventListener() {}, removeEventListener() {},
+    appendChild(c) { c.parent = node; node.children.push(c); return c; },
+    insertBefore(c, ref) {
+      c.parent = node;
+      const i = ref ? node.children.indexOf(ref) : -1;
+      if (i < 0) node.children.push(c);
+      else node.children.splice(i, 0, c);
+      return c;
+    },
+    removeChild(c) {
+      const i = node.children.indexOf(c);
+      if (i >= 0) node.children.splice(i, 1);
+      return c;
+    },
+  };
+  node.childNodes = node.children;
+  node.ownerDocument = node;
+  return node;
+}
+
+/**
+ * Render a component with the vendored preact into a fake document, and return the element tree.
+ * @param {any} vnode
+ * @returns {any} the root element node
+ */
+async function renderDom(vnode) {
+  const { render } = await preact();
+  const prevDoc = globalThis.document;
+  const root = fakeDomNode('div');
+  globalThis.document = {
+    createElement: (tag) => fakeDomNode(tag),
+    createElementNS: (_ns, tag) => fakeDomNode(tag),
+    createTextNode: (data) => { const n = fakeDomNode('#text'); n.nodeType = 3; n.data = data; return n; },
+    documentElement: root,
+    body: root,
+  };
+  try {
+    render(vnode, root);
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document;
+    else globalThis.document = prevDoc;
+  }
+  return root;
+}
+
+
 describe('store.js', () => {
   test('createStore get/set/patch/subscribe', async () => {
     const { createStore } = await mod('store.js');
@@ -454,6 +513,164 @@ describe('net.js', () => {
     assert.equal(ws().last('hello').token, undefined);
   });
 
+  test('a 游客 (guest) never presents the account, even while one is remembered', async () => {
+    const { accountStore, guestStore } = await mod('net.js');
+    const orig = globalThis.localStorage;
+    const backing = new Map();
+    try {
+      globalThis.localStorage = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => backing.set(k, String(v)),
+        removeItem: (k) => backing.delete(k),
+      };
+      accountStore.write({ token: 'c'.repeat(64), username: 'somebody' });
+      guestStore.write(true);
+
+      const { net, ws } = await makeNet();
+      net.setName('凯尔希');
+      assert.equal(net.helloCandidateName(), '凯尔希', 'a guest opens the session with its callsign');
+      ws().open();
+      const hello = ws().last('hello');
+      assert.equal(hello.account, undefined, 'no account token is sent');
+      assert.equal(hello.accountName, undefined);
+      assert.equal(hello.name, '凯尔希');
+
+      // leaving guest mode hands the account back to the transport
+      guestStore.write(false);
+      assert.equal(net.helloCandidateName(), null, 'the account names the session again');
+    } finally {
+      if (orig === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = orig;
+    }
+  });
+
+  test('enterAsGuest: switching to 游客 drops the account and clears the 干员调配', async () => {
+    const { accountStore, guestStore, net } = await mod('net.js');
+    const { loadoutStore } = await mod('ui/loadoutSync.js');
+    const { enterAsGuest, isGuest, setGuest } = await mod('screens/title.js');
+    const orig = globalThis.localStorage;
+    const origWS = globalThis.WebSocket;
+    const backing = new Map();
+    try {
+      globalThis.localStorage = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => backing.set(k, String(v)),
+        removeItem: (k) => backing.delete(k),
+      };
+      // A fake socket that opens on demand: the guest transition queues `auth.logout` until the socket is open,
+      // exactly like the title screen does before a session exists.
+      const frames = [];
+      globalThis.WebSocket = class {
+        constructor() { this.readyState = 0; this.sent = frames; }
+        open() { this.readyState = 1; this.onopen?.(); }
+        send(data) { frames.push(JSON.parse(data)); }
+        close() { this.readyState = 3; }
+      };
+      net.close();          // a known starting point for the module singleton
+      net._manualClose = false;
+      net.connect();
+      net.ws.open();
+      setGuest(false);
+      assert.equal(await enterAsGuest(), false, 'no account → nothing to leave');
+      accountStore.write({ token: 'd'.repeat(64), username: 'someone' });
+      loadoutStore.set({ entries: { chess_char_1_01_a: { skill: 0 } }, ops: { char_002_amiya: { potential: 3 } } });
+
+      assert.equal(await enterAsGuest(), true);
+      assert.ok(frames.some((m) => m.t === 'auth.logout'), 'the session is told to let go of the account');
+      assert.equal(accountStore.read(), null, 'the account is gone from this device');
+      assert.equal(isGuest(), true, 'the guest marker is remembered');
+      assert.deepEqual(loadoutStore.get().entries, {}, 'the loadout is cleared');
+      assert.deepEqual(loadoutStore.get().ops, {}, '潜能 / 练度 are cleared');
+      assert.equal(backing.get('sp.account'), undefined);
+      assert.equal(globalThis.localStorage.getItem('sp.guest'), '1');
+    } finally {
+      net.close();
+      if (orig === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = orig;
+      if (origWS === undefined) delete globalThis.WebSocket;
+      else globalThis.WebSocket = origWS;
+    }
+  });
+
+  test('a logged-in account opens the session without a callsign (the server resolves the username)', async () => {
+    const { accountStore } = await mod('net.js');
+    const longName = 'a'.repeat(24); // a username may be longer than NAME_MAX_LEN (12)
+    const orig = globalThis.localStorage;
+    const backing = new Map();
+    try {
+      globalThis.localStorage = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => backing.set(k, String(v)),
+        removeItem: (k) => backing.delete(k),
+      };
+      accountStore.write({ token: 'a'.repeat(64), username: longName });
+
+      const { net, ws } = await makeNet();
+      assert.equal(net.helloCandidateName(), null, 'the account name is not a callsign');
+      assert.ok(net.canHello(), 'the account token alone can open a session');
+      net.setName('typed-by-hand');
+      ws().open();
+      const hello = ws().last('hello');
+      assert.equal(hello.name, undefined, 'no name is sent: the server uses the verified account username');
+      assert.equal(hello.account, 'a'.repeat(64));
+      assert.equal(hello.accountName, longName, 'the username is only a hint; the server verifies it');
+      assert.equal(hello.token, 'tok-1', 'the reconnect token still rides along');
+      assert.equal(net.status, 'handshaking');
+      ws().recv({ t: 'welcome', rid: hello.rid, playerId: 'p_1', token: 't', name: longName, accountName: longName, serverNow: Date.now() });
+      assert.equal(net.status, 'online');
+      assert.equal(net.serverName, longName, 'the welcome carries the verified name');
+      assert.equal(globalThis.localStorage.getItem('sp.account'), JSON.stringify({ token: 'a'.repeat(64), username: longName }), 'the account stays remembered');
+    } finally {
+      if (orig === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = orig;
+    }
+  });
+
+  test('a welcome that does not confirm the account drops the dead bearer and flags it (no guest continuation)', async () => {
+    const { accountStore } = await mod('net.js');
+    const orig = globalThis.localStorage;
+    const backing = new Map();
+    try {
+      globalThis.localStorage = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => backing.set(k, String(v)),
+        removeItem: (k) => backing.delete(k),
+      };
+      accountStore.write({ token: 'e'.repeat(64), username: 'Alice' });
+      const { net, ws, sockets } = await makeNet();
+      net.setName('Alice'); // the callsign this browser remembers (main.js `entered` at boot)
+      ws().open();
+      const hello = ws().last('hello');
+      assert.equal(hello.account, 'e'.repeat(64));
+      assert.equal(net.accountRejected, null, 'nothing rejected yet');
+      // The server no longer knows the token (accounts.json was wiped with a rebuilt container): its `welcome`
+      // carries no `accountName`, and the session it opens is a 游客's named 博士 — an account hello sends no callsign.
+      ws().recv({ t: 'welcome', rid: hello.rid, playerId: 'p_9', token: 't2', name: '博士', serverNow: Date.now() });
+      assert.deepEqual(net.accountRejected, { username: 'Alice' }, 'the app is told which account failed');
+      assert.equal(accountStore.read(), null, 'the dead bearer is gone: it is never presented again');
+      assert.equal(accountStore.lastUsername(), 'Alice', 'the login form still knows the username');
+      assert.equal(net.status, 'online', 'the session itself is a usable one');
+      // …and the transport does NOT quietly install a guest identity: no second hello, the session keeps the server's
+      // fallback name until the player signs in again or picks 以游客身份继续 themselves (main.js keeps them out).
+      assert.equal(sockets.length, 1, 'no reconnect');
+      assert.equal(ws().sent.filter((m) => m.t === 'hello').length, 1, 'no automatic guest hello');
+      assert.equal(net.serverName, '博士');
+      // When the player does choose to continue as a 游客, that hello carries their callsign and no account…
+      net.setName('Alice');
+      const guest = ws().last('hello');
+      assert.equal(guest.name, 'Alice');
+      assert.equal(guest.account, undefined);
+      assert.equal(guest.accountName, undefined);
+      // …and the next welcome clears the flag (a later account login re-arms the same check).
+      ws().recv({ t: 'welcome', rid: guest.rid, playerId: 'p_9', token: 't3', name: 'Alice', serverNow: Date.now() });
+      assert.equal(net.accountRejected, null);
+      assert.equal(net.serverName, 'Alice');
+    } finally {
+      if (orig === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = orig;
+    }
+  });
+
   test('request resolves on ok, rejects on error with ERR text', async () => {
     const { net, ws } = await onlineNet();
     const p1 = net.request('room.create', { mode: 'coop', difficulty: 'HARD' });
@@ -544,6 +761,33 @@ describe('net.js', () => {
     ws().recv({ t: 'pong', c: 'garbage', s: 1 });
     ws().recv({ t: 'pong', c: timers.now() + 99999, s: 1 }); // negative rtt ignored
     assert.equal(net.ping, 40);
+  });
+
+  test('the shown latency is the path\'s, not what this page was busy with', async () => {
+    const { PING_WINDOW_MS } = await mod('net.js');
+    const { net, ws, timers } = await onlineNet();
+    const pong = (ms) => {
+      net.probe();
+      const p = ws().last('ping');
+      timers.advance(ms);
+      ws().recv({ t: 'pong', c: p.c, s: p.c });
+    };
+    // a page in a match: the pong sits in the socket while the page simulates, so the raw sample reads 164 ms
+    pong(164);
+    assert.equal(net.pingLast, 164, 'the raw sample keeps what really happened');
+    assert.equal(net.ping, 164, 'a single sample is all there is to show');
+    // a round trip the page was not busy for: this is the number a player should see
+    pong(66);
+    assert.equal(net.pingLast, 66);
+    assert.equal(net.ping, 66);
+    // another stall does not report the server as slow…
+    pong(200);
+    assert.equal(net.pingLast, 200);
+    assert.equal(net.ping, 66, 'the window keeps the path latency');
+    // …and once the older samples age out, the window follows the path again
+    timers.advance(PING_WINDOW_MS + 1);
+    pong(190);
+    assert.equal(net.ping, 190, 'nothing left in the window but the newest sample');
   });
 
   test('silent socket is detected and replaced', async () => {
@@ -1027,6 +1271,72 @@ describe('screen helpers', () => {
     assert.match(source, /<\$\{SettingsModal\} open=\$\{settingsOpen\}/, 'settings control opens the shared modal');
   });
 
+  test('title: a 游客 pressing 开始 is offered the account first (the nudge), and can still enter', () => {
+    const source = readFileSync(path.join(PUBLIC, 'js/screens/title.js'), 'utf8');
+    assert.match(source, /if \(!nudgeOff\) \{ setNudgeOpen\(true\); return; \}/, '开始 asks first while the nudge is on');
+    assert.match(source, /<\$\{Modal\} open=\$\{true\} micro="ACCOUNT"/, 'the nudge is a game modal, never the login form itself');
+    assert.match(source, /t\('登录可同步干员调配、统计与对局'\)/, 'it says what an account keeps in sync');
+    assert.match(source, /t\('以游客身份继续'\)/, '继续以游客身份 enters without an account, as before');
+    assert.match(source, /title-nudge__off/, 'with its 不再提示 checkbox');
+    assert.match(source, /loadPref\(NUDGE_PREF, false\)/, '不再提示 is a browser preference (store.js prefs)');
+  });
+
+  test('enterAsAccount: the account name enters the game and is never rewritten in accountStore', async () => {
+    const { accountStore, net } = await mod('net.js');
+    const { store } = await mod('store.js');
+    const { enterAsAccount } = await mod('screens/title.js');
+    const origStore = globalThis.localStorage;
+    const origWS = globalThis.WebSocket;
+    const backing = new Map();
+    const opened = [];
+    try {
+      globalThis.localStorage = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => backing.set(k, String(v)),
+        removeItem: (k) => backing.delete(k),
+      };
+      // the module singleton `net` connects for real on setName(): a stub that stays CONNECTING keeps the test
+      // offline and starts no heartbeat (see the 游客 test above)
+      globalThis.WebSocket = class { constructor(url) { opened.push(url); this.readyState = 0; } send() {} close() {} };
+      net.close();          // a known starting point for the module singleton
+      net._manualClose = false;
+      // a 23-char username (USERNAME_RE allows 24) is longer than a callsign (NAME_MAX_LEN 12)
+      const long = 'long_name_24_chars_okay';
+      accountStore.write({ token: 'b'.repeat(64), username: long });
+      assert.equal(enterAsAccount(), true);
+      assert.equal(store.get().me.name, 'long_name_24', 'the local display name is clamped like a callsign');
+      assert.equal(store.get().session.entered, true, 'the title screen is left');
+      assert.equal(accountStore.read().username, long, 'the account keeps the full username');
+      assert.equal(opened.length, 1, 'entering opens the socket');
+      accountStore.clear();
+      assert.equal(enterAsAccount(), false, 'no account → nothing to enter with');
+    } finally {
+      net.close();
+      if (origStore === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = origStore;
+      if (origWS === undefined) delete globalThis.WebSocket;
+      else globalThis.WebSocket = origWS;
+    }
+  });
+
+  test('the 游客 login nudge: 不再提示 is a browser preference (sp.pref.guestLoginNudge)', async () => {
+    const { isLoginNudgeOff, setLoginNudgeOff } = await mod('screens/title.js');
+    const origStore = globalThis.localStorage;
+    const local = memStorage();
+    try {
+      globalThis.localStorage = local;
+      assert.equal(isLoginNudgeOff(), false, 'a fresh browser asks a 游客 who presses 开始');
+      setLoginNudgeOff(true);
+      assert.equal(local.getItem('sp.pref.guestLoginNudge'), 'true', 'the choice is stored under the sp.pref. prefix');
+      assert.equal(isLoginNudgeOff(), true, 'and the nudge stays off from then on');
+      setLoginNudgeOff(false);
+      assert.equal(isLoginNudgeOff(), false, 'it can be switched back on');
+    } finally {
+      if (origStore === undefined) delete globalThis.localStorage;
+      else globalThis.localStorage = origStore;
+    }
+  });
+
   test('lobby: normalizeCode / parseRoomParam / difficultyInfo', async () => {
     const { normalizeCode, parseRoomParam, difficultyInfo, MODE_TEXT } = await mod('screens/lobby.js');
     assert.equal(normalizeCode('ab-c d9'), 'ABCD');
@@ -1151,6 +1461,23 @@ describe('screen helpers', () => {
     assert.equal(hf.canStart, true, 'a spectator never blocks the start');
     assert.equal(hf.spectating, false);
     assert.deepEqual(roomFacts({ ...room, spectators: 'bad' }, 'h').spectators, []);
+  });
+
+  test('components: TextField type (the account modal password is not typed in clear)', async () => {
+    const { h } = await preact();
+    const { TextField } = await mod('ui/components.js');
+    const of = (node, tag) => {
+      const out = [];
+      const walk = (n) => { if (n.tag === tag) out.push(n); for (const c of n.children) walk(c); };
+      walk(node);
+      return out;
+    };
+    const pass = of(await renderDom(h(TextField, { label: '密码', value: 'hunter2', type: 'password' })), 'input')[0];
+    assert.ok(pass, 'an input is rendered');
+    assert.equal(pass.attrs.type, 'password', 'type="password" reaches the <input>');
+    assert.equal(pass.attrs.value, 'hunter2');
+    const plain = of(await renderDom(h(TextField, { label: '账号', value: 'alice' })), 'input')[0];
+    assert.equal(plain.attrs.type, 'text', 'defaults to text');
   });
 
   test('components: roman / doctorNo / secondsLeft', async () => {

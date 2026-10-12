@@ -50,6 +50,9 @@ describe('the settings entry of the lobby and the room', { skip: !ENABLED && 'se
     await page.waitForSelector('input', { timeout: 15000 });
     await page.type('input', '测试博士');
     await page.evaluate(() => [...document.querySelectorAll('button')].find((b) => /开始/.test(b.textContent))?.click());
+    // a 游客 gets the account nudge first (title.js start): 继续以游客身份 enters as before (absent with 不再提示)
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll('.modal__actions button')].find((b) => /以游客身份继续/.test(b.textContent))?.click());
     await page.waitForSelector('.lobby-screen', { timeout: 15000 });
     await sleep(500);
 

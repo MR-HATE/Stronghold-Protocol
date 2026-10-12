@@ -275,20 +275,26 @@ describe('multi-device (Chrome device emulation)', { skip: !ENABLED && 'set SP_E
       // a fresh profile: another device's saved session (same origin) would resume straight into its room
       const ctx = await browser.createBrowserContext();
       const { page, problems } = await open(dev, '/', { ctx });
-      const tapText = async (sel, text) => {
+      const tapText = async (sel, text, { optional = false } = {}) => {
         const r = await page.evaluate((s, t) => {
           const el = [...document.querySelectorAll(s)].find((x) => !t || x.textContent.includes(t));
           if (!el) return null;
           const b = el.getBoundingClientRect();
           return { x: b.left + b.width / 2, y: b.top + b.height / 2 };
         }, sel, text);
-        assert.ok(r, `${sel} ${text || ''}`);
+        if (!r) {
+          if (optional) return false;
+          assert.ok(r, `${sel} ${text || ''}`);
+        }
         await page.touchscreen.tap(r.x, r.y);
         await sleep(350);
+        return true;
       };
       await tapText('.title-login input');
       await page.keyboard.type('凯尔希');
       await tapText('.title-login button', '开始');
+      // a 游客 gets the account nudge first (title.js start): 继续以游客身份 enters as before (absent with 不再提示)
+      await tapText('.modal__actions button', '以游客身份继续', { optional: true });
       await page.waitForSelector('.lobby-screen', { timeout: 15000 }).catch(async (err) => {
         await page.screenshot({ path: path.join(OUT, `device-${dev}-lobby-FAILED.png`) });
         throw err;
