@@ -24,8 +24,10 @@
 //   * Disconnect in LOBBY: the seat shows connected=false and is freed after `lobbyGraceMs` (60 s); a
 //     session that comes back after that gets `room.closed {reason:'timeout'}`.
 //     Disconnect in a match: the seat is kept and match.onDisconnect(playerId) is called.
-//   * Reconnect: `hello` with a known token (reconnect window, 10 min, see net.js) rebinds the session;
-//     the lobby then broadcasts room.state and, in a match, calls match.onReconnect(playerId).
+//   * Reconnect: `hello` with a known token (reconnect window, 10 min, see net.js) rebinds the session; the lobby then
+//     broadcasts room.state and, in a match, calls match.onReconnect(playerId) — AFTER `welcome`, which net.js sends
+//     first (onHello is identity only, onHelloResend is the state push). The order is the client's: its post-resume
+//     restore grace (main.js RESTORE_GRACE_MS) counts only the frames that follow the welcome as fresh.
 //     Solo runs (下半: "休整期及机变阶段没有时间限制…24小时内随时返回", research 01 §1 / 06 §17): a session that drops
 //     while its solo room's match runs stays resumable for the official `config.constants.singleReconnectTime`
 //     (86400 s; option `soloReconnectWindowMs` overrides it) instead of the 10-minute window — the untimed solo match
@@ -36,6 +38,15 @@
 //     (broadcast only when the seat visibly changed, e.g. a rename in LOBBY); the heavy part (match.onReconnect,
 //     or the result replay below) runs at most once per `resyncMinGapMs` per session — extra requests inside
 //     that window coalesce into one deferred resync, so hello spam cannot amplify into ~15 KB per request.
+//   * Account seat (extension §account, server/accounts.js): `hello { account }` resolves the token to the account
+//     and then to the session holding that account's seat (net.js handler.sessionForAccount), so signing in on
+//     another device, browser or tab resumes the same seat — and a running match is resynced by exactly the
+//     reconnect path above, windows included (10 min; a solo run 24 h; a server restart loses the room as it
+//     always did). A seat is restored ONLY into the account that took it: a session belonging to another account
+//     — or to no account, a 游客's seat — leaves its room / running match behind as soon as a different account is
+//     verified on it (dropForeignSeat → releaseForeignSeat, called by auth.login / auth.register and by
+//     accountHello, with `room.closed {reason:'account'}` for the client), so a match is never handed to an
+//     account it was not played under.
 //   * Result replay: the match's final m.public and each human's m.result are kept after the match ends. A
 //     human who resyncs (resume after a drop, a reloaded tab, a repeated hello) while the room is back in LOBBY
 //     gets room.state followed by those two frames again, until they act in the room (ready, difficulty, the
@@ -56,7 +67,8 @@
 //     onEnd(summary) → room back to LOBBY (departed seats freed, humans un-readied, disconnected humans
 //     get the lobby grace), dispose() on the next macrotask. Players can start again.
 //   * room.closed reasons: 'timeout' (removed after lobby grace), 'kicked' (room.kick, room.removeSpectator), 'empty' (a
-//     spectator whose room lost its last player), 'shutdown' (server stopping).
+//     spectator whose room lost its last player), 'account' (another account signed in on the session, accountHello
+//     / releaseForeignSeat), 'shutdown' (server stopping).
 //   * Operator loadout (DESIGN §16): room.loadout { entries } is checked strictly against the game data
 //     (shared/protocol.js checkLoadout: known visible chess, a skill index legal for the normal AND the elite status, a
 //     module of the elite or 'none'; any bad entry rejects the whole message, nothing is stored). ▸ It is stored on the
@@ -249,9 +261,10 @@ export class Lobby {
    *   now?: () => number,
    *   seedFn?: () => number,
    *   options?: Partial<typeof LOBBY_DEFAULTS>,
+   *   accounts?: import('./accounts.js').AccountStore | null,
    * }} opts
    */
-  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, options = {} }) {
+  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, options = {}, accounts = null }) {
     this.registry = registry;
     this.log = log;
     this.MatchClass = MatchClass;
@@ -259,6 +272,8 @@ export class Lobby {
     this.now = now;
     this.seedFn = seedFn || (() => randomInt(2 ** 32));
     this.opts = { ...LOBBY_DEFAULTS, ...options };
+    /** Optional AccountStore (server/accounts.js, extension §account). Null ⇒ auth.* is refused with BAD_MSG. */
+    this.accounts = accounts;
     /** @type {Map<string, Room>} */
     this.rooms = new Map();
     /** @type {Map<string, NodeJS.Timeout>} lobby grace timers by playerId */
@@ -291,11 +306,25 @@ export class Lobby {
   // ---------------------------------------------------------------------------------------------------
 
   /**
-   * After `welcome`: resend room state / match state for resumed (or repeated) hellos.
+   * Runs BEFORE `welcome` (net.js awaits it): adopt the account when the frame carried one. Identity only — the
+   * room / match state of a resumed hello goes out in onHelloResend, AFTER the welcome, which is what the client's
+   * restore grace measures against (net.js sendWelcome).
+   *
+   * Async on purpose: `welcome` is sent only once this settles, so the verified account name (and the account's
+   * saved 干员调配) are in place before the client learns the session's name — the player is shown as their
+   * account from its very first frame, never renamed afterwards.
+   * @param {import('./net.js').Session} session
+   */
+  async onHello(session) {
+    await this.accountHello(session);
+  }
+
+  /**
+   * Runs AFTER `welcome` (net.js sendWelcome): resend room / match state for a resumed (or repeated) hello.
    * @param {import('./net.js').Session} session
    * @param {{ resumed: boolean, repeat: boolean }} info
    */
-  onHello(session, { resumed, repeat }) {
+  onHelloResend(session, { resumed, repeat }) {
     if (!resumed && !repeat) return;
     const room = this.roomOf(session);
     if (!room) {
@@ -350,6 +379,16 @@ export class Lobby {
       case 'room.diy': return this.diy(session, msg);
       case 'room.spectate': return this.spectate(session, msg);
       case 'room.removeSpectator': return this.removeSpectator(session, msg);
+      // account extension (§account, server/accounts.js): the title screen logs in / registers before it has a
+      // session (net.js mints a throwaway one for these frames), so they never need a room.
+      case 'auth.register': return this.authRegister(session, msg);
+      case 'auth.login': return this.authLogin(session, msg);
+      case 'auth.logout': return this.authLogout(session);
+      // 对局统计 mirror (extension §account, server/stats.js): a 游客's frames are no-ops — nothing is stored
+      // without an account token, and the client only sends them while signed in.
+      case 'stats.push': return this.statsPush(session, msg);
+      case 'stats.pull': return this.statsPull(session);
+      case 'stats.clear': return this.statsClear(session);
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGame(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -392,6 +431,199 @@ export class Lobby {
     this.graceTimers.clear();
     for (const t of this.resyncTimers.values()) clearTimeout(t);
     this.resyncTimers.clear();
+  }
+
+  // ---------------------------------------------------------------------------------------------------
+  // Account extension (§account) — server/accounts.js
+  // ---------------------------------------------------------------------------------------------------
+
+  /**
+   * The session that already holds this account's seat, or null — asked by net.js BEFORE it mints a session for a
+   * `hello { account }` frame, so signing in on another device/tab restores that seat (room / running match)
+   * instead of sitting down twice. Synchronous on purpose: the store is in memory once loaded
+   * (AccountStore.lookupToken; server/http/websocket.js awaits the load at boot).
+   * @param {string} token
+   * @returns {import('./net.js').Session | null}
+   */
+  sessionForAccount(token) {
+    if (!this.accounts || typeof this.accounts.lookupToken !== 'function') return null;
+    const acct = this.accounts.lookupToken(token);
+    return acct ? this.registry.byAccount(acct.key) : null;
+  }
+
+  /**
+   * Adopt the account behind `session.accountToken` as this session's identity, as part of `hello` (net.js awaits
+   * the hook that calls this, before it sends `welcome`).
+   *
+   * The account username is the player's in-game name, so a logged-in player never types a callsign: the client
+   * sends `hello { account }` with no name at all (a username may be 24 chars, longer than the NAME_MAX_LEN a
+   * callsign is clamped to) and the name verified here wins over whatever the frame asked for — a client cannot
+   * claim another player's account name by presenting its token with a different name. An unknown / revoked
+   * token is ignored: the frame's own name (or the DEFAULT_NAME net.js set) stands, so a stale localStorage
+   * entry can still enter the game.
+   * @param {import('./net.js').Session} session
+   */
+  async accountHello(session) {
+    if (!this.accounts || !session.accountToken) return;
+    const token = session.accountToken;
+    const acct = await this.accounts.resolveToken(token);
+    if (!acct) {
+      // An unknown / revoked token is inert. Release the account map entry (net.js may have matched this session
+      // by its seat) but keep `accountKey`: the SEAT still belongs to the account that took it, so a later valid
+      // token for that account comes back to it, and no other account may inherit it (releaseForeignSeat below).
+      this.registry.unbindAccount?.(session);
+      session.accountToken = null;
+      session.accountName = null;
+      return;
+    }
+    // Isolation (extension §account): a seat is restored only into the account that took it. A session that
+    // belongs to another account — or that nobody's account took, a 游客 seat — leaves its room / running match
+    // behind rather than handing it to this one (the alternative is the same browser signing in as somebody
+    // else and walking into a match that was never theirs).
+    this.dropForeignSeat(session, acct.key);
+    // Verified: the account owns this session (and only this one — another tab / device of the same account
+    // reaches the same session through net.js sessionForAccount, so it resumes the seat instead of taking one).
+    this.registry.bindAccount?.(acct.key, session);
+    session.accountName = acct.username;
+    session.name = acct.username;
+    // The saved 干员调配 belongs to the account (DESIGN §16): pull it last, so the client's own sync right after
+    // `welcome` sends these entries back instead of overwriting the account with this browser's copy.
+    if (acct.loadout) session.loadout = acct.loadout;
+    if (acct.ops) session.ops = acct.ops;
+  }
+
+  /**
+   * A verified account is being attached to this session: if the seat belongs to a DIFFERENT identity, leave it
+   * first (releaseForeignSeat). Called the moment the credential is verified — `auth.login` / `auth.register`,
+   * which attach the account to the session they ran on, and `accountHello` for the tokens a `hello` carries — so
+   * no intent of the new identity can ever reach the previous one's room, not even between a login and its hello.
+   * @param {import('./net.js').Session} session @param {string} accountKey the verified account
+   */
+  dropForeignSeat(session, accountKey) {
+    if (session.accountKey !== accountKey) this.releaseForeignSeat(session);
+  }
+
+  /**
+   * Leave the seat this session held under a different identity, because another account is signing in on it
+   * (dropForeignSeat). It is a permanent departure — the same thing room.leave / g.leave does: in the lobby the seat
+   * is freed, during a match the seat is abandoned and the match is told (Match.onLeave). The client is told as
+   * well: it may be showing that room / match right now (a second tab on the title screen resumes the seat before
+   * the player presses 开始), and a stale screen must not outlive the seat. The account's own saved 干员调配 is
+   * untouched — it belongs to the account, not to the seat.
+   * @param {import('./net.js').Session} session
+   */
+  releaseForeignSeat(session) {
+    const room = this.roomOf(session);
+    if (!room) return;
+    const was = session.accountKey;
+    this.log.info(`[lobby] ${room.code} seat released: an account signs in where ${was || '游客'} was seated`);
+    this.removeMember(room, session.playerId);
+    if (session.connected) sendSession(session, { t: 'room.closed', reason: 'account' });
+  }
+
+  /**
+   * `auth.register { username, password }` → `auth.result { ok, token, username, loadout, ops }`.
+   * The returned `token` is a bearer for this account: the client stores it (public/js/net.js accountStore) and
+   * passes it on every later `hello` as `account`. The session is renamed to the new username right away, and the
+   * next hello re-runs the same resolution (accountHello) — the player is on the title screen, so the client
+   * enters the game with that name as soon as the reply arrives.
+   */
+  async authRegister(session, { username, password }) {
+    if (!this.accounts) return fail(ERR.BAD_MSG, 'accounts disabled on this server');
+    const r = await this.accounts.register(username, password);
+    if (!r.ok) {
+      // map store errors onto the small existing ERR vocabulary (BAD_MSG covers shape/policy; ALREADY = taken)
+      return fail(r.error === 'TAKEN' ? ERR.ALREADY : ERR.BAD_MSG, r.detail);
+    }
+    session.accountToken = r.token;
+    session.accountName = r.username;
+    session.name = r.username; // the account name is the in-game name (see accountHello)
+    // The new account claims this session now (not only at the hello that follows): a seat another identity was
+    // holding is left behind at once.
+    this.dropForeignSeat(session, r.key);
+    // immediately sync whatever the player already built in this browser into the new account
+    if (session.loadout || session.ops) void this.accounts.saveLoadout(r.token, session.loadout, session.ops);
+    return { ok: true, authResult: { token: r.token, username: r.username, loadout: session.loadout || r.loadout, ops: session.ops || r.ops,
+      stats: r.stats, statsClearedAt: r.statsClearedAt } };
+  }
+
+  /** `auth.login { username, password }` → `auth.result { ok, token, username, loadout, ops }`. */
+  async authLogin(session, { username, password }) {
+    if (!this.accounts) return fail(ERR.BAD_MSG, 'accounts disabled on this server');
+    const r = await this.accounts.login(username, password);
+    if (!r.ok) {
+      // NOT_FOUND and BAD_PASSWORD both surface as BAD_MSG (no account enumeration), with a small detail
+      return fail(ERR.BAD_MSG, r.detail);
+    }
+    session.accountToken = r.token;
+    session.accountName = r.username;
+    session.name = r.username; // the account name is the in-game name (see accountHello)
+    // As in authRegister: the verified account claims the session here, so a seat another identity held is left
+    // behind immediately (accountHello re-checks it for the seat a `hello { token }` may have matched).
+    this.dropForeignSeat(session, r.key);
+    // Pull the account's saved 干员调配 into the session (the room / match pick it up from session.loadout on
+    // the next request, and the client's loadoutSync pushes a `room.loadout` right after welcome to overwrite
+    // whatever it had locally).
+    if (r.loadout) session.loadout = r.loadout;
+    if (r.ops) session.ops = r.ops;
+    // The 对局统计 mirror travels in the reply as well (title.js applies it before entering; the welcome-driven
+    // stats sync pulls it too, for a session that resumed without a login).
+    return { ok: true, authResult: { token: r.token, username: r.username, loadout: r.loadout, ops: r.ops,
+      stats: r.stats, statsClearedAt: r.statsClearedAt } };
+  }
+
+  /**
+   * `auth.logout` → `ok`: this session leaves its account and becomes a 游客.
+   *
+   * The account's saved 干员调配 must survive it, which is the point: while the session is detached, the 游客's
+   * local loadout is no longer written to the account (the account store is only touched through `session.accountToken`),
+   * and the client clears its copy so guest play starts from the defaults. A later `auth.login` pulls the account's
+   * own loadout back out. Everything the seat held stays on the seat — only the account binding is dropped.
+   *
+   * `accountKey` deliberately stays: the SEAT still belongs to that account, so the same account signing in again
+   * (this browser or another device) comes back to it, while a different account signing in on this session leaves
+   * it behind (accountHello / releaseForeignSeat) instead of inheriting it.
+   */
+  authLogout(session) {
+    session.accountToken = null;
+    session.accountName = null;
+    return OK;
+  }
+
+  // ---------------------------------------------------------------------------------------------------
+  // 对局统计 mirror (extension §account) — server/stats.js
+  // ---------------------------------------------------------------------------------------------------
+
+  /**
+   * `stats.push {stats}` → `ok`: merge the client's 对局统计 envelope into its account's mirror (union by record id,
+   * server/stats.js). Idempotent on purpose — a client repushes its whole list after every local change, so the
+   * union has to be cheap to repeat. A 游客 (no account on this session) is a silent no-op: guest statistics never
+   * leave the browser (docs/design/client.md §10 statistics).
+   */
+  statsPush(session, { stats }) {
+    if (!this.accounts || !session.accountToken) return OK;
+    // fire-and-forget like the loadout write: the store persists atomically on its own and a lost write is not
+    // worth an error toast (the next push carries the same records)
+    void this.accounts.saveStats(session.accountToken, stats);
+    return OK;
+  }
+
+  /**
+   * `stats.pull` → `stats.sync {stats, clearedAt}`: the account's mirror back to the client, which merges it into
+   * its local history. A 游客 gets the plain `ok` — there is nothing to pull, and the client must not read that as
+   * an empty account copy.
+   */
+  statsPull(session) {
+    if (!this.accounts || !session.accountToken) return OK;
+    const acct = this.accounts.lookupToken(session.accountToken);
+    return { ok: true, statsSync: { stats: acct?.stats || null, clearedAt: acct?.statsClearedAt ?? null } };
+  }
+
+  /** `stats.clear` → `ok`: 清空统计数据 — drop the account's mirror and stamp it, so other devices drop it too. */
+  statsClear(session) {
+    if (!this.accounts || !session.accountToken) return OK;
+    void this.accounts.clearStats(session.accountToken);
+    return OK;
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -648,6 +880,8 @@ export class Lobby {
     const opsSet = freezeOps(resOps.ops);
     session.loadout = loadout;
     session.ops = opsSet;
+    // Persist to the bound account (extension §account; fire-and-forget — the store writes atomically on its own).
+    if (this.accounts && session.accountToken) void this.accounts.saveLoadout(session.accountToken, loadout, opsSet);
     const room = this.roomOf(session);
     if (!room) return OK;
     const seat = room.seatOf(session.playerId);
@@ -703,9 +937,14 @@ export class Lobby {
     return OK;
   }
 
-  /** Extra fields of every `welcome` (net.js): the operators a 自选 slot may field (shared/diy.js `kitted`). */
-  welcomeInfo() {
-    return { diyKitted: KITTED_CHARS };
+  /**
+   * Extra fields of every `welcome` (net.js sendWelcome): the operators a 自选 slot may field (shared/diy.js
+   * `kitted`), and — when this session is logged in (extension §account, resolved in accountHello before the
+   * welcome is sent) — the verified account username.
+   * @param {import('./net.js').Session} [session]
+   */
+  welcomeInfo(session) {
+    return { diyKitted: KITTED_CHARS, ...(session?.accountName ? { accountName: session.accountName } : null) };
   }
 
   // ---------------------------------------------------------------------------------------------------

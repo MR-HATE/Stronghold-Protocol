@@ -28,9 +28,22 @@
 //   1001 server shutdown
 //
 // The handler object (implemented by server/lobby.js) receives:
-//   onHello(session, { resumed, repeat })  after `welcome` was sent
-//   welcomeInfo() → object (optional)      extra fields of every `welcome` (never one of its own keys): the lobby's
-//                                          `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may field)
+//   onHello(session, { resumed, repeat })  runs BEFORE `welcome` is sent; may return a promise, in which case
+//                                          `welcome` waits for it (the lobby resolves the optional account token
+//                                          there, so the verified account name travels in the same frame).
+//                                          Identity only — it must NOT push room / match state (onHelloResend).
+//   onHelloResend(session, { resumed, repeat }) (optional) runs AFTER `welcome` was sent: the room / match state of
+//                                          a resumed (or repeated) hello. The order is what the client's post-resume
+//                                          restore grace counts on (main.js RESTORE_GRACE_MS: only frames that
+//                                          follow the welcome are fresh), so state pushed earlier is dropped again.
+//   welcomeInfo(session) → object (optional) extra fields of every `welcome` (never one of its own keys): the
+//                                          lobby's `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may
+//                                          field) and `accountName` (extension §account — the verified username)
+//   sessionForAccount(account) → Session|null (optional)  the session that already holds that account's seat; asked
+//                                          BEFORE a new session is minted, so `hello { account }` from another
+//                                          device/tab restores that seat instead of sitting down twice. The lobby
+//                                          verifies the token against the account store (extension §account) and
+//                                          answers synchronously; net.js stays transport-only.
 //   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined
 //   routeGame(session, msg) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
 //                                          straight to the running match through it; without it they reach onMessage
@@ -40,7 +53,7 @@
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
-import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
+import { ERR, ERR_TEXT, NAME_MAX_LEN, DEFAULT_NAME, PROTOCOL_VERSION } from '../shared/constants.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
@@ -64,10 +77,12 @@ export const NET_DEFAULTS = Object.freeze({
  * Intents that also draw from the per-connection heavy bucket: g.watch (its reply is a large state resend, m.field),
  * room.loadout (a ≤ 160-entry map and ≤ 256 operator settings validated against the game data; the client debounces its
  * edits), room.ownership
- * (a ≤ 160-id list, the same way), room.diy (≤ 8 自选 picks checked against the data, the same way) and room.spectate
- * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate).
+ * (a ≤ 160-id list, the same way), room.diy (≤ 8 自选 picks checked against the data, the same way), room.spectate
+ * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate)
+ * and the account extension's stats.push / stats.pull (a ≤ 48 KB 对局统计 envelope in, the whole mirror back out —
+ * server/stats.js).
  */
-export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate']);
+export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'stats.push', 'stats.pull']);
 
 /** Close codes (see header). */
 export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
@@ -118,6 +133,23 @@ export class Session {
     this.notOwned = null;
     /** @type {Readonly<Record<string, { charId: string, skillIndex: number, uniEquipId: string|null }>> | null} checked 自选 picks (lobby-owned, 0.2.0 自选编队) */
     this.diy = null;
+    /** @type {string | null} account-level token (extension §account, server/accounts.js); null = not logged in */
+    this.accountToken = null;
+    /** @type {string | null} verified account username — the in-game name when logged in (lobby-owned) */
+    this.accountName = null;
+    /**
+     * @type {string | null} the account key (lowercased username) this session's SEAT belongs to (lobby-owned,
+     * extension §account). Never reassigned to a different account without the lobby first releasing the seat
+     * (lobby.js accountHello / releaseForeignSeat), which is what keeps one account's room/match out of another's.
+     */
+    this.accountKey = null;
+    /**
+     * @type {boolean} true while this session exists only as a placeholder for the `auth.*` frames the title
+     * screen sends before it has a session (see onFrame): the following `hello` then runs its normal identity
+     * lookup — reconnect token, account seat — as if the socket had no session at all, and reuses the
+     * placeholder when nothing matched. net-owned.
+     */
+    this.provisional = false;
     /** @type {string} client address of the latest connection (logging) */
     this.addr = '?';
     /** @type {string | null} per-network limit key of the latest connection (null = not limited), see clientAddress */
@@ -144,6 +176,8 @@ export class SessionRegistry {
     this.now = now;
     /** @type {Map<string, Session>} */ this.byPlayerId = new Map();
     /** @type {Map<string, Session>} */ this.byTokenMap = new Map();
+    /** @type {Map<string, Session>} account key (lowercased username) → the session holding its seat (extension §account) */
+    this.byAccountMap = new Map();
   }
 
   get size() { return this.byPlayerId.size; }
@@ -178,10 +212,47 @@ export class SessionRegistry {
   /** @param {string} playerId @returns {Session | null} */
   byId(playerId) { return this.byPlayerId.get(playerId) || null; }
 
+  /**
+   * Give an account key the session that holds its seat, so the same account opening a session from another
+   * device/tab resumes that seat instead of sitting down twice — the account behaves like a reconnect token,
+   * which is what a player expects from "logging in". Not verified here: server/lobby.js accountHello resolves
+   * the token against the store, and only a successful resolution reaches this call (after the lobby has
+   * released a seat that belonged to a different account).
+   * @param {string} accountKey lowercased username @param {Session} s
+   */
+  bindAccount(accountKey, s) {
+    if (typeof accountKey !== 'string' || !accountKey) return;
+    this.unbindAccount(s);
+    const prev = this.byAccountMap.get(accountKey);
+    if (prev && prev !== s) this.byAccountMap.delete(accountKey);
+    s.accountKey = accountKey;
+    this.byAccountMap.set(accountKey, s);
+  }
+
+  /**
+   * Drop this session's entry in the account map, leaving `s.accountKey` alone: the seat still belongs to that
+   * account (a token that stopped resolving, a 游客 transition), and only lobby.accountHello may hand it to
+   * another account.
+   * @param {Session} s
+   */
+  unbindAccount(s) {
+    if (s.accountKey && this.byAccountMap.get(s.accountKey) === s) this.byAccountMap.delete(s.accountKey);
+  }
+
+  /** @param {unknown} accountKey @returns {Session | null} the live session holding this account's seat */
+  byAccount(accountKey) {
+    if (typeof accountKey !== 'string' || accountKey.length === 0) return null;
+    const s = this.byAccountMap.get(accountKey);
+    if (!s) return null;
+    if (this.isExpired(s, this.now())) return null;
+    return s;
+  }
+
   /** @param {Session} s */
   remove(s) {
     if (this.byPlayerId.get(s.playerId) === s) this.byPlayerId.delete(s.playerId);
     if (this.byTokenMap.get(s.token) === s) this.byTokenMap.delete(s.token);
+    this.unbindAccount(s);
   }
 
   /**
@@ -611,6 +682,23 @@ export class Network {
       return;
     }
     if (msg.t === 'hello') { this.onHelloMsg(conn, msg, now); return; }
+    // The account extension's auth.* may arrive before hello: the title screen logs in / registers on an open
+    // socket that has no session yet. Mint a placeholder session so the lobby has something to bind to — the
+    // client enters with a real `hello { account }` right after the reply, which renames it.
+    if (!conn.session && (msg.t === 'auth.register' || msg.t === 'auth.login')) {
+      const anon = this.registry.create(DEFAULT_NAME);
+      if (anon) {
+        // `provisional`: this is not a session yet, just somewhere for the login to land. The next `hello` runs
+        // the normal identity lookup (reconnect token, account seat — onHelloMsg) as if the socket had none, so
+        // signing in on a second device still reaches the seat its account holds; nothing matched ⇒ the
+        // placeholder is reused, so a fresh login wastes no playerId.
+        anon.provisional = true;
+        conn.session = anon;
+        anon.ws = conn.ws;
+        anon.connected = true;
+        anon.disconnectedAt = null;
+      }
+    }
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
     if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
@@ -624,13 +712,31 @@ export class Network {
       this.log.error(`[net] handler crashed on ${msg.t}`, e);
       res = { error: ERR.INTERNAL };
     }
+    // Async handlers (extension §account auth.register / auth.login are scrypt-bound) return a Promise — await it
+    // before replying. Match/room handlers stay sync and pass through unchanged.
+    if (res && typeof res.then === 'function') {
+      res.then((r) => this.dispatchReply(conn, msg, rid, r))
+        .catch((e) => { this.log.error(`[net] async handler crashed on ${msg.t}`, e); this.reply(conn, errorMsg(ERR.INTERNAL, rid)); });
+      return;
+    }
+    this.dispatchReply(conn, msg, rid, res);
+  }
+
+  /** @param {Connection} conn @param {any} msg @param {any} rid @param {any} res */
+  dispatchReply(conn, msg, rid, res) {
     if (res && res.error) {
       // fire-and-forget battle progress (no rid) that reached no running match — the match just ended, the room went
       // back to the lobby — is stale, not a client mistake: never answered (DESIGN §14; a rid-less error frame would
       // surface as an error toast in the browser)
       if (msg.t === 'b.progress' && !validRid(rid)) return;
       this.reply(conn, errorMsg(isErrCode(res.error) ? res.error : ERR.INTERNAL, rid, res.detail));
-    } else if (validRid(rid)) this.reply(conn, { t: 'ok', rid });
+    } else if (validRid(rid)) {
+      // auth.register / auth.login answer with a payload of their own (extension §account), stats.pull answers with
+      // the account's 对局统计 mirror; every other intent acknowledges with a bare `ok`.
+      if (res && res.authResult) this.reply(conn, { ...res.authResult, t: 'auth.result', rid });
+      else if (res && res.statsSync) this.reply(conn, { t: 'stats.sync', rid, ...res.statsSync });
+      else this.reply(conn, { t: 'ok', rid });
+    }
   }
 
   /** @param {Connection} conn @param {any} msg @param {number} now */
@@ -640,26 +746,54 @@ export class Network {
       this.reply(conn, errorMsg(ERR.BAD_MSG, rid, `version mismatch: server ${PROTOCOL_VERSION}`));
       return;
     }
-    const name = sanitizeName(msg.name);
-    if (!name) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'bad field name')); return; }
+    // Account token (optional, extension §account): attach it to the session; the lobby's handler resolves it
+    // against the store and, when it verifies, adopts the account username as the session name — net.js itself
+    // has no dependency on accounts.js (it stays transport-only). That can be asynchronous, so `welcome` is sent
+    // only once onHello has settled: the client gets the verified name in the same frame that opens its session
+    // and never sees a rename.
+    const account = typeof msg.account === 'string' && msg.account ? msg.account : null;
+    let name = sanitizeName(msg.name);
+    // A name is required unless the frame carries an account token: the token supplies the name, and a username
+    // is longer than a callsign (24 chars vs NAME_MAX_LEN = 12), so a logged-in client does not send one.
+    // The fallback covers a token this server cannot resolve (a reset account store, say) — accountHello then
+    // replaces it with the verified username, and an unknown token leaves it as the player's name.
+    if (!name) {
+      if (!account) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'bad field name')); return; }
+      name = DEFAULT_NAME;
+    }
 
-    let session = conn.session;
+    let session = conn.session && !conn.session.provisional ? conn.session : null;
+    // The placeholder minted for pre-hello auth.* frames is replaced by whatever this hello resolves to (and
+    // reused when nothing does), so it never blocks an account from reaching its seat.
+    const placeholder = session ? null : conn.session;
     let resumed = false;
     const repeat = !!session;
     if (!session) {
       session = msg.token ? this.registry.byToken(msg.token) : null;
+      // The account is an identity like the reconnect token: the same account coming back from another device or
+      // browser resumes the seat it holds (the room / running match) instead of taking a second one. The lobby
+      // verifies the token against its account store and answers with that account's session (a token this
+      // server cannot resolve leaves the freshly created session in place); `byToken` above wins when both are
+      // known, and the lobby's accountHello then releases a seat that belonged to a DIFFERENT account.
+      if (!session && account) session = this.handler.sessionForAccount?.(account) || null;
       if (session) {
-        if (session.connected && session.ws && session.ws !== conn.ws
+        // A connected holder may refuse to be replaced (a second tab recovering a token): an account login is an
+        // explicit "this is me, here" though, so a frame that carries one is always allowed to take the seat.
+        if (!account && session.connected && session.ws && session.ws !== conn.ws
           && (msg.noReplace || (Number.isFinite(msg.claimAt) && session.claimAt != null && msg.claimAt > session.claimAt))) {
           this.reply(conn, errorMsg(ERR.SESSION_IN_USE, rid));
           return;
         }
         resumed = true;
         if (session.ws && session.ws !== conn.ws) this.detachReplaced(session.ws);
+        if (placeholder && placeholder !== session) this.registry.remove(placeholder);
+      } else if (placeholder) {
+        session = placeholder; // nothing matched: the auth.* placeholder becomes the session
       } else {
         session = this.registry.create(name);
         if (!session) { this.reply(conn, errorMsg(ERR.INTERNAL, rid, 'server full')); return; }
       }
+      session.provisional = false;
       conn.session = session;
       session.ws = conn.ws;
       session.connected = true;
@@ -670,16 +804,49 @@ export class Network {
     session.lastSeen = now;
     session.addr = conn.ip;
     session.limitKey = conn.key;
+    if (account) session.accountToken = account;
 
+    let hello;
+    try {
+      hello = this.handler.onHello?.(session, { resumed, repeat });
+    } catch (e) {
+      this.log.error('[net] onHello crashed', e);
+    }
+    if (hello && typeof hello.then === 'function') {
+      // An async onHello resolved an account (or crashed): welcome once it settles, unless this connection lost
+      // the session meanwhile (a racing hello on another socket owns it from then on).
+      hello.catch((e) => this.log.error('[net] onHello crashed', e))
+        .then(() => {
+          if (session.ws !== conn.ws) return;
+          this.sendWelcome(conn, session, rid, { resumed, repeat, now });
+        });
+      return;
+    }
+    this.sendWelcome(conn, session, rid, { resumed, repeat, now });
+  }
+
+  /**
+   * Send `welcome` for a session whose hello has settled (see onHelloMsg), then let the handler push the room /
+   * match state of a resumed (or repeated) hello.
+   *
+   * The order is load-bearing: the client arms its post-resume restore grace when `welcome` arrives and treats only
+   * the frames that follow it as fresh (main.js onWelcome / RESTORE_GRACE_MS). A resync that overtook the welcome
+   * counted as stale and was dropped again a moment later — the restored room / match vanished and the player fell
+   * back to the lobby (the bug an account restore from another device surfaced, because a plain reconnect keeps the
+   * state alive through the continuous match pushes).
+   * @param {Connection} conn @param {import('./net.js').Session} session @param {any} rid
+   * @param {{ resumed: boolean, repeat: boolean, now: number }} info
+   */
+  sendWelcome(conn, session, rid, { resumed, repeat, now }) {
     let extra = null;
-    try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
+    try { extra = this.handler.welcomeInfo?.(session) ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
     const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
     if (validRid(rid)) welcome.rid = rid;
     this.reply(conn, welcome);
     try {
-      this.handler.onHello?.(session, { resumed, repeat });
+      this.handler.onHelloResend?.(session, { resumed, repeat });
     } catch (e) {
-      this.log.error('[net] onHello crashed', e);
+      this.log.error('[net] onHelloResend crashed', e);
     }
   }
 
