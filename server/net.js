@@ -24,7 +24,7 @@
 // Close codes used by the server (clients should NOT auto-reconnect on 4001):
 //   4001 session replaced (the same token connected from another socket/tab)
 //   4002 hello timeout
-//   1008 abusive flooding (rate-limit drops > abuseDropsPerSec)
+//   1008 abusive flooding (rate-limit drops > abuseDropsPerSec within the 10 s abuse window)
 //   1001 server shutdown
 //
 // The handler object (implemented by server/lobby.js) receives:
@@ -59,7 +59,7 @@ import { ERR, ERR_TEXT, NAME_MAX_LEN, DEFAULT_NAME, PROTOCOL_VERSION } from '../
 export const NET_DEFAULTS = Object.freeze({
   ratePerSec: 40,               // token bucket refill rate
   rateBurst: 40,                // token bucket capacity
-  abuseDropsPerSec: 400,        // rate-limited messages within one second before the socket is closed (1008)
+  abuseDropsPerSec: 400,        // rate-limited messages within the abuse window before the socket is closed (1008)
   heartbeatMs: 30_000,          // ping interval; a socket that missed one full interval is terminated
   helloTimeoutMs: 30_000,       // sockets that never say hello are closed (4002)
   reconnectWindowMs: 10 * 60_000, // disconnected sessions stay resumable this long
@@ -652,7 +652,10 @@ export class Network {
     if (conn.session && conn.session.ws === conn.ws) conn.session.lastSeen = now;
 
     if (!conn.bucket.take(now)) {
-      if (now - conn.dropWindowAt >= 1000) { conn.dropWindowAt = now; conn.drops = 0; }
+      // The drop counter rolls over a wider window (10s instead of 1s) so the 400-drops threshold is also
+      // reachable on a slow server: a flooding client that the server can only process at ~100 frames/s
+      // (e.g. permessage-deflate + a contended host) drops ~100 messages/s, well under 400 in any 1s window.
+      if (now - conn.dropWindowAt >= 10_000) { conn.dropWindowAt = now; conn.drops = 0; }
       if (++conn.drops > this.opts.abuseDropsPerSec) {
         this.log.warn(`[net] closing flooding socket ${conn.ip}`);
         conn.close(CLOSE.POLICY, 'rate limit');
