@@ -55,10 +55,15 @@ export function narrowDeflateOffer(header) {
  * The session stack of one server.
  * @param {{ MatchClass?: Function, seedFn?: () => number, accounts?: AccountStore, accountsDir?: string, [option: string]: any }} opts
  *   startServer() options
- * @param {{ data: object, log: object }} deps the game data the lobby's matches use, the logger
+ * @param {{ data: object, log: object, content?: { cs: string } | null,
+ *   plugins?: ReturnType<typeof import('../plugins/roomSets.js').createRoomSets> | null,
+ *   hosts?: ReturnType<typeof import('../match/host/index.js').createMatchHosts> | null }} deps the game data the lobby's
+ *   matches use, the logger, the vanilla content (server/plugins/identity.js: welcome / room.state content, BattleSpec
+ *   cs), the room sets a room's host chooses from (room.setPlugins: visual and content sets), the match hosts a room with
+ *   gameplay plugins plays in (DESIGN §32.6)
  * @returns {Promise<{ registry: SessionRegistry, lobby: Lobby, network: Network, accounts: AccountStore|null }>}
  */
-export async function createSessionStack(opts, { data, log }) {
+export async function createSessionStack(opts, { data, log, content = null, plugins = null, hosts = null }) {
   const netOptions = netOptionsFrom(opts);
   const registry = new SessionRegistry({ reconnectWindowMs: netOptions.reconnectWindowMs ?? NET_DEFAULTS.reconnectWindowMs });
   const lobbyOptions = lobbyOptionsFrom(opts);
@@ -74,7 +79,7 @@ export async function createSessionStack(opts, { data, log }) {
       accounts = null;
     }
   }
-  const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, options: lobbyOptions, accounts });
+  const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, content, plugins, hosts, options: lobbyOptions, accounts });
   const network = new Network({ registry, handler: lobby, log, options: netOptions });
   return { registry, lobby, network, accounts };
 }

@@ -59,7 +59,7 @@ function clientPool(getUrl) {
 describe('server/stats.js: the mirror merges', () => {
   test('normalizeStatsPayload accepts only the current envelope with usable ids', () => {
     assert.equal(normalizeStatsPayload(null), null);
-    assert.equal(normalizeStatsPayload({ v: 2, records: [] }), null, 'a newer version is not this build\'s');
+    assert.equal(normalizeStatsPayload({ v: STATS_VERSION + 1, records: [] }), null, 'a newer version is not this build\'s');
     assert.equal(normalizeStatsPayload({ v: STATS_VERSION, records: {} }), null);
     assert.equal(normalizeStatsPayload({ v: STATS_VERSION, records: [{ t: 1 }] }), null, 'a record needs an id');
     assert.deepEqual(normalizeStatsPayload(payload([rec('a', 1)])).records.length, 1);

@@ -38,13 +38,16 @@
 //                                          follow the welcome are fresh), so state pushed earlier is dropped again.
 //   welcomeInfo(session) → object (optional) extra fields of every `welcome` (never one of its own keys): the
 //                                          lobby's `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may
-//                                          field) and `accountName` (extension §account — the verified username)
+//                                          field), `accountName` (extension §account — the verified username) and
+//                                          `content` ({ vanilla: <cs> }, the server's content hash — DESIGN §32)
 //   sessionForAccount(account) → Session|null (optional)  the session that already holds that account's seat; asked
 //                                          BEFORE a new session is minted, so `hello { account }` from another
 //                                          device/tab restores that seat instead of sitting down twice. The lobby
 //                                          verifies the token against the account store (extension §account) and
 //                                          answers synchronously; net.js stays transport-only.
-//   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined
+//   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined — or a Promise of one
+//                                          (a room whose match runs in a match host worker, DESIGN §32.6: the reply
+//                                          goes out when it settles; a rejection is INTERNAL)
 //   routeGame(session, msg) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
 //                                          straight to the running match through it; without it they reach onMessage
 //   onDisconnect(session)                  the session's socket closed (session kept for the reconnect window)
@@ -78,11 +81,11 @@ export const NET_DEFAULTS = Object.freeze({
  * room.loadout (a ≤ 160-entry map and ≤ 256 operator settings validated against the game data; the client debounces its
  * edits), room.ownership
  * (a ≤ 160-id list, the same way), room.diy (≤ 8 自选 picks checked against the data, the same way), room.spectate
- * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate)
- * and the account extension's stats.push / stats.pull (a ≤ 48 KB 对局统计 envelope in, the whole mirror back out —
- * server/stats.js).
+ * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate),
+ * room.setPlugins (a new visual set: every member downloads its art manifest — server/plugins/visualSet.js) and the
+ * account extension's stats.push / stats.pull (a ≤ 48 KB 对局统计 envelope in, the whole mirror back out — server/stats.js).
  */
-export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'stats.push', 'stats.pull']);
+export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'room.setPlugins', 'stats.push', 'stats.pull']);
 
 /** Close codes (see header). */
 export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
@@ -715,18 +718,26 @@ export class Network {
       this.log.error(`[net] handler crashed on ${msg.t}`, e);
       res = { error: ERR.INTERNAL };
     }
-    // Async handlers (extension §account auth.register / auth.login are scrypt-bound) return a Promise — await it
-    // before replying. Match/room handlers stay sync and pass through unchanged.
     if (res && typeof res.then === 'function') {
-      res.then((r) => this.dispatchReply(conn, msg, rid, r))
-        .catch((e) => { this.log.error(`[net] async handler crashed on ${msg.t}`, e); this.reply(conn, errorMsg(ERR.INTERNAL, rid)); });
+      // An answer that has to wait, sent when it settles; a rejection is INTERNAL. Two sources: extension §account
+      // (auth.register / auth.login are scrypt-bound) and DESIGN §32.6 (a room whose match runs in a match host
+      // worker answers once the worker has — server/lobby.js keeps each such room's messages in order). Match/room
+      // handlers of a vanilla room stay sync and pass through unchanged.
+      Promise.resolve(res).then((r) => this.answer(conn, msg, rid, r), (e) => {
+        this.log.error(`[net] handler failed on ${msg.t}`, e);
+        this.answer(conn, msg, rid, { error: ERR.INTERNAL });
+      });
       return;
     }
-    this.dispatchReply(conn, msg, rid, res);
+    this.answer(conn, msg, rid, res);
   }
 
-  /** @param {Connection} conn @param {any} msg @param {any} rid @param {any} res */
-  dispatchReply(conn, msg, rid, res) {
+  /**
+   * The direct reply to a handled message: `error` (with the ERR code) or `ok` when the request carried a rid. Never
+   * throws (a socket closed meanwhile simply gets nothing).
+   * @param {Connection} conn @param {any} msg @param {unknown} rid @param {any} res the handler's result
+   */
+  answer(conn, msg, rid, res) {
     if (res && res.error) {
       // fire-and-forget battle progress (no rid) that reached no running match — the match just ended, the room went
       // back to the lobby — is stale, not a client mistake: never answered (DESIGN §14; a rid-less error frame would
